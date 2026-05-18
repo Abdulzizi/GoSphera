@@ -5,8 +5,14 @@
       :firms-fetched="firmsData.length"
       :sse-connected="sseConnected"
       :aircraft-count="aircraftData.length"
+      :ship-count="shipData.length"
       :map-style="mapStyle"
+      :show-aircraft="showAircraft"
+      :show-ships="showShips"
+      :show-cameras="showCameras"
+      :show-fire="showFire"
       @style-change="mapStyle = $event"
+      @toggle-layer="toggleLayer"
     />
     <div class="main-grid">
       <LeftPanel
@@ -17,8 +23,14 @@
         :data="geoData"
         :fire-data="firmsData"
         :aircraft-data="aircraftData"
+        :ship-data="shipData"
+        :camera-data="cameraData"
         :is-loading="isLoading"
         :map-style="mapStyle"
+        :show-aircraft="showAircraft"
+        :show-ships="showShips"
+        :show-cameras="showCameras"
+        :show-fire="showFire"
       />
       <RightPanel
         :fire-records="firmsData"
@@ -40,11 +52,15 @@ import {
   getSpatialData,
   getSituationalData,
   getAircraftData,
+  getShipData,
+  getCameraData,
   openEventStream,
   type FeatureCollection,
   type FireRecord,
   type TelemetryEvent,
   type AircraftState,
+  type ShipState,
+  type CameraInfo,
 } from './services/api'
 
 interface QueryParams {
@@ -59,12 +75,30 @@ const firmsData      = ref<FireRecord[]>([])
 const firmsTotal     = ref(0)
 const liveEvents     = ref<TelemetryEvent[]>([])
 const aircraftData   = ref<AircraftState[]>([])
+const shipData       = ref<ShipState[]>([])
+const cameraData     = ref<CameraInfo[]>([])
 const sseConnected   = ref(false)
 const isLoading      = ref(false)
 const mapStyle       = ref<'dark' | 'light' | 'satellite'>('dark')
 
+// Layer visibility
+const showAircraft   = ref(true)
+const showShips      = ref(true)
+const showCameras    = ref(true)
+const showFire       = ref(true)
+
+type LayerName = 'aircraft' | 'ships' | 'cameras' | 'fire'
+
+function toggleLayer(layer: LayerName) {
+  if (layer === 'aircraft') showAircraft.value = !showAircraft.value
+  else if (layer === 'ships')   showShips.value   = !showShips.value
+  else if (layer === 'cameras') showCameras.value = !showCameras.value
+  else if (layer === 'fire')    showFire.value    = !showFire.value
+}
+
 let closeStream: (() => void) | null = null
 let aircraftTimer: ReturnType<typeof setInterval> | null = null
+let shipTimer:     ReturnType<typeof setInterval> | null = null
 
 async function loadSituational() {
   try {
@@ -84,6 +118,14 @@ async function loadAircraft() {
   }
 }
 
+async function loadShips() {
+  try {
+    shipData.value = await getShipData()
+  } catch (err) {
+    console.error('[App] failed to load ship data:', err)
+  }
+}
+
 function onTelemetryEvent(event: TelemetryEvent) {
   liveEvents.value.unshift(event)
   if (liveEvents.value.length > MAX_EVENTS) {
@@ -91,11 +133,20 @@ function onTelemetryEvent(event: TelemetryEvent) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   loadSituational()
   loadAircraft()
-  // Poll aircraft every 15 s (respects OpenSky anonymous rate limit)
+  loadShips()
+
+  // Load cameras once — static list
+  try {
+    cameraData.value = await getCameraData()
+  } catch (err) {
+    console.error('[App] failed to load camera data:', err)
+  }
+
   aircraftTimer = setInterval(loadAircraft, 15_000)
+  shipTimer     = setInterval(loadShips,    15_000)
 
   closeStream = openEventStream(
     onTelemetryEvent,
@@ -107,6 +158,7 @@ onMounted(() => {
 onUnmounted(() => {
   closeStream?.()
   if (aircraftTimer) clearInterval(aircraftTimer)
+  if (shipTimer)     clearInterval(shipTimer)
 })
 
 async function handleQuery(params: QueryParams) {

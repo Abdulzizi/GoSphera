@@ -74,6 +74,34 @@ export function getAircraftData(): Promise<AircraftState[]> {
   return apiFetch<AircraftState[]>(`${API_BASE}/aircraft`)
 }
 
+export interface ShipState {
+  mmsi: number
+  name: string
+  lat: number
+  lon: number
+  speed: number    // knots
+  heading: number  // degrees
+  ship_type: number
+  last_seen: number // unix seconds
+}
+
+export interface CameraInfo {
+  id: string
+  name: string
+  city: string
+  lat: number
+  lon: number
+  snapshot_url: string
+}
+
+export function getShipData(): Promise<ShipState[]> {
+  return apiFetch<ShipState[]>(`${API_BASE}/ships`)
+}
+
+export function getCameraData(): Promise<CameraInfo[]> {
+  return apiFetch<CameraInfo[]>(`${API_BASE}/cameras`)
+}
+
 export function postTelemetry(event: TelemetryEvent): Promise<void> {
   return apiFetch<void>(`${API_BASE}/telemetry`, {
     method: 'POST',

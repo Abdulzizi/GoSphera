@@ -22,7 +22,12 @@
 
       <span class="stat-chip chip-blue">
         <span class="dot dot-blue" />
-        ✈ {{ aircraftCount.toLocaleString() }} aircraft
+        ✈ {{ aircraftCount.toLocaleString() }}
+      </span>
+
+      <span class="stat-chip chip-teal">
+        <span class="dot dot-teal" />
+        🚢 {{ shipCount.toLocaleString() }}
       </span>
 
       <span :class="['stat-chip', sseConnected ? 'chip-green' : 'chip-red']">
@@ -32,6 +37,29 @@
     </div>
 
     <div class="nav-right">
+      <!-- Layer toggles -->
+      <button
+        :class="['layer-btn', showAircraft && 'layer-active']"
+        title="Toggle aircraft layer"
+        @click="emit('toggle-layer', 'aircraft')"
+      >✈ Air</button>
+      <button
+        :class="['layer-btn', showShips && 'layer-active']"
+        title="Toggle ship layer"
+        @click="emit('toggle-layer', 'ships')"
+      >🚢 Sea</button>
+      <button
+        :class="['layer-btn', showCameras && 'layer-active']"
+        title="Toggle camera layer"
+        @click="emit('toggle-layer', 'cameras')"
+      >📷 Cam</button>
+      <button
+        :class="['layer-btn', showFire && 'layer-active']"
+        title="Toggle fire layer"
+        @click="emit('toggle-layer', 'fire')"
+      >🔥 Fire</button>
+
+      <!-- Map style toggle -->
       <button class="nav-btn" :title="`Switch map style (current: ${mapStyle})`" @click="cycleStyle">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="15" height="15">
           <path v-if="mapStyle === 'dark'" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
@@ -61,15 +89,21 @@
 import { computed } from 'vue'
 
 const props = defineProps<{
-  firmsCount: number
+  firmsCount:   number
   firmsFetched: number
   sseConnected: boolean
   aircraftCount: number
-  mapStyle: 'dark' | 'light' | 'satellite'
+  shipCount:    number
+  mapStyle:     'dark' | 'light' | 'satellite'
+  showAircraft: boolean
+  showShips:    boolean
+  showCameras:  boolean
+  showFire:     boolean
 }>()
 
 const emit = defineEmits<{
-  'style-change': [style: 'dark' | 'light' | 'satellite']
+  'style-change':  [style: 'dark' | 'light' | 'satellite']
+  'toggle-layer':  [layer: 'aircraft' | 'ships' | 'cameras' | 'fire']
 }>()
 
 const styles = ['dark', 'light', 'satellite'] as const
@@ -96,12 +130,14 @@ function cycleStyle() {
   height: 48px;
   flex-shrink: 0;
   z-index: 100;
+  gap: 12px;
 }
 
 .nav-left {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-shrink: 0;
 }
 
 .nav-icon {
@@ -121,25 +157,29 @@ function cycleStyle() {
 .nav-center {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex: 1;
+  justify-content: center;
+  flex-wrap: wrap;
 }
 
 .stat-chip {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
+  padding: 3px 9px;
   background: #131920;
   border: 1px solid #1e2a35;
   border-radius: 20px;
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   color: #8ab0c8;
   white-space: nowrap;
 }
 
-.chip-blue    { border-color: #1a3a5a; }
-.chip-green   { border-color: #1a4a2a; }
-.chip-red     { border-color: #4a1a1a; }
+.chip-blue  { border-color: #1a3a5a; }
+.chip-teal  { border-color: #0a3a2a; }
+.chip-green { border-color: #1a4a2a; }
+.chip-red   { border-color: #4a1a1a; }
 
 .dot {
   width: 7px;
@@ -150,6 +190,7 @@ function cycleStyle() {
 
 .dot-orange { background: #f97316; }
 .dot-blue   { background: #3a8fd4; }
+.dot-teal   { background: #10b981; }
 .dot-green  { background: #22c55e; }
 .dot-red    { background: #ef4444; }
 
@@ -162,8 +203,30 @@ function cycleStyle() {
 .nav-right {
   display: flex;
   align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
+/* Layer toggle buttons */
+.layer-btn {
+  padding: 4px 9px;
+  background: #131920;
+  border: 1px solid #1e2a35;
+  border-radius: 5px;
+  color: #4a6070;
+  font-size: 0.74rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.layer-btn:hover { color: #8ab0c8; background: #1a2535; }
+.layer-btn.layer-active {
+  color: #c0d8e8;
+  background: #1a2535;
+  border-color: #3a8fd4;
+}
+
+/* Map style toggle */
 .nav-btn {
   display: flex;
   align-items: center;
@@ -176,7 +239,7 @@ function cycleStyle() {
   font-size: 0.8rem;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
-  min-width: 100px;
+  min-width: 88px;
 }
 .nav-btn:hover { background: #1a2535; color: #c0d8e8; }
 </style>
