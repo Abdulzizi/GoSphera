@@ -74,13 +74,24 @@ type tflPlace struct {
 // the hardcoded Jakarta cameras. Falls back to Jakarta-only on error.
 func FetchAndPopulate(cache *Cache) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(tflJamCamURL)
+
+	req, _ := http.NewRequest("GET", tflJamCamURL, nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "GoSphera/1.0")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("[cameras] TfL fetch failed: %v — using Jakarta only\n", err)
 		cache.Set(jakartaCameras)
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("[cameras] TfL returned HTTP %d — using Jakarta only\n", resp.StatusCode)
+		cache.Set(jakartaCameras)
+		return
+	}
 
 	var places []tflPlace
 	if err := json.NewDecoder(resp.Body).Decode(&places); err != nil {
