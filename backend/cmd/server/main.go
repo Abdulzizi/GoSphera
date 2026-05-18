@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -86,9 +87,8 @@ func main() {
 	r.Get("/api/situational", handleSituational(firmsCache))
 	r.Get("/api/aircraft", handleAircraft(aircraftCache))
 	r.Get("/api/ships", handleShips(maritimeCache))
-	r.Get("/api/cameras", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, cameraCache.GetAll())
-	})
+	r.Get("/api/cameras", handleCameras(cameraCache))
+	r.Get("/api/camera-proxy/{id}", handleCameraProxy(cameraCache))
 	r.Post("/api/telemetry", handleTelemetryIngest(pipeline))
 	r.Get("/api/events", handleSSE(broker))
 
@@ -327,6 +327,55 @@ func handleTelemetryIngest(p *telemetry.Pipeline) http.HandlerFunc {
 
 		p.Ingest(event)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "id": event.ID})
+	}
+}
+
+// handleCameras handles GET /api/cameras with optional bbox filtering.
+func handleCameras(cache *camera.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cams := cache.GetAll()
+		bbox := parseBboxFilter(r)
+		if bbox.active {
+			filtered := cams[:0:0]
+			for _, c := range cams {
+				if c.Lat >= bbox.minLat && c.Lat <= bbox.maxLat &&
+					c.Lon >= bbox.minLon && c.Lon <= bbox.maxLon {
+					filtered = append(filtered, c)
+				}
+			}
+			cams = filtered
+		}
+		writeJSON(w, http.StatusOK, cams)
+	}
+}
+
+// handleCameraProxy proxies a camera's StreamURL to the browser, solving CORS for
+// MJPEG sources that don't set Access-Control-Allow-Origin headers.
+// Only proxies cameras whose StreamURL is non-empty.
+func handleCameraProxy(cache *camera.Cache) http.HandlerFunc {
+	proxyClient := &http.Client{Timeout: 30 * time.Second}
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		cam := cache.FindByID(id)
+		if cam == nil || cam.StreamURL == "" {
+			http.Error(w, "camera not found or no stream URL", http.StatusNotFound)
+			return
+		}
+		resp, err := proxyClient.Get(cam.StreamURL)
+		if err != nil {
+			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body) //nolint:errcheck
 	}
 }
 

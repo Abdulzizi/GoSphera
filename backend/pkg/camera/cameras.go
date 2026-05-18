@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-// Camera describes a public traffic/surveillance camera with a live snapshot URL.
+// Camera describes a public traffic/surveillance camera.
+// StreamType is one of: "snapshot" (polled JPEG), "mjpeg" (multipart stream, rendered via <img>),
+// or "hls" (HLS .m3u8 playlist, played via hls.js / native Safari).
 type Camera struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
@@ -16,21 +18,42 @@ type Camera struct {
 	Lat         float64 `json:"lat"`
 	Lon         float64 `json:"lon"`
 	SnapshotURL string  `json:"snapshot_url"`
+	StreamURL   string  `json:"stream_url,omitempty"` // live stream URL (HLS .m3u8 or MJPEG endpoint)
+	StreamType  string  `json:"stream_type"`           // "snapshot" | "mjpeg" | "hls"
 }
 
 // ── Jakarta hardcoded cameras (Dinas Perhubungan DKI open CCTV) ────────────────
-// These stream via the official Jakarta CCTV portal.
 var jakartaCameras = []Camera{
-	{ID: "jkt-001", Name: "Bundaran HI", City: "Jakarta", Lat: -6.1950, Lon: 106.8229,
-		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/bundaran_hi.jpg"},
-	{ID: "jkt-002", Name: "Semanggi Interchange", City: "Jakarta", Lat: -6.2088, Lon: 106.8197,
-		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/semanggi.jpg"},
-	{ID: "jkt-003", Name: "Thamrin – Sarinah", City: "Jakarta", Lat: -6.1866, Lon: 106.8231,
-		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/sarinah.jpg"},
-	{ID: "jkt-004", Name: "Blok M", City: "Jakarta", Lat: -6.2441, Lon: 106.7993,
-		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/blokm.jpg"},
-	{ID: "jkt-005", Name: "Sudirman – Polda", City: "Jakarta", Lat: -6.2174, Lon: 106.8225,
-		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/sudirman_polda.jpg"},
+	{
+		ID: "jkt-001", Name: "Bundaran HI", City: "Jakarta",
+		Lat: -6.1950, Lon: 106.8229,
+		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/bundaran_hi.jpg",
+		StreamType:  "snapshot",
+	},
+	{
+		ID: "jkt-002", Name: "Semanggi Interchange", City: "Jakarta",
+		Lat: -6.2088, Lon: 106.8197,
+		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/semanggi.jpg",
+		StreamType:  "snapshot",
+	},
+	{
+		ID: "jkt-003", Name: "Thamrin – Sarinah", City: "Jakarta",
+		Lat: -6.1866, Lon: 106.8231,
+		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/sarinah.jpg",
+		StreamType:  "snapshot",
+	},
+	{
+		ID: "jkt-004", Name: "Blok M", City: "Jakarta",
+		Lat: -6.2441, Lon: 106.7993,
+		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/blokm.jpg",
+		StreamType:  "snapshot",
+	},
+	{
+		ID: "jkt-005", Name: "Sudirman – Polda", City: "Jakarta",
+		Lat: -6.2174, Lon: 106.8225,
+		SnapshotURL: "https://cctv.jakarta.go.id/assets/cam/sudirman_polda.jpg",
+		StreamType:  "snapshot",
+	},
 }
 
 // ── Cache (holds cameras fetched from TfL + Jakarta hardcoded) ────────────────
@@ -56,6 +79,19 @@ func (c *Cache) GetAll() []Camera {
 	return out
 }
 
+// FindByID returns the camera with the given ID, or nil if not found.
+func (c *Cache) FindByID(id string) *Camera {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for i := range c.data {
+		if c.data[i].ID == id {
+			cp := c.data[i]
+			return &cp
+		}
+	}
+	return nil
+}
+
 // ── TfL JamCam fetcher ────────────────────────────────────────────────────────
 
 const tflJamCamURL = "https://api.tfl.gov.uk/Place/Type/JamCam"
@@ -72,6 +108,7 @@ type tflPlace struct {
 
 // FetchAndPopulate fetches TfL JamCam data into the cache, then appends
 // the hardcoded Jakarta cameras. Falls back to Jakarta-only on error.
+// All cameras fetched here are "snapshot" type (TfL provides JPEG-only).
 func FetchAndPopulate(cache *Cache) {
 	client := &http.Client{Timeout: 15 * time.Second}
 
@@ -123,6 +160,7 @@ func FetchAndPopulate(cache *Cache) {
 			Lat:         p.Lat,
 			Lon:         p.Lon,
 			SnapshotURL: imgURL,
+			StreamType:  "snapshot", // TfL provides JPEG snapshots only
 		})
 	}
 

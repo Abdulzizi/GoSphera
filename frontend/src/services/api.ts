@@ -61,6 +61,10 @@ export interface CameraInfo {
   lat: number
   lon: number
   snapshot_url: string
+  /** Live stream URL — HLS .m3u8, MJPEG endpoint, or absent for snapshot-only cameras. */
+  stream_url?: string
+  /** How to render the live feed: "snapshot" = polled img, "mjpeg" = img stream, "hls" = video+hls.js */
+  stream_type: 'snapshot' | 'mjpeg' | 'hls'
 }
 
 /**
@@ -127,8 +131,8 @@ export function getShipData(): Promise<ShipState[]> {
   return apiFetch<ShipState[]>(`${API_BASE}/ships`)
 }
 
-export function getCameraData(): Promise<CameraInfo[]> {
-  return apiFetch<CameraInfo[]>(`${API_BASE}/cameras`)
+export function getCameraData(bbox?: BBox): Promise<CameraInfo[]> {
+  return apiFetch<CameraInfo[]>(`${API_BASE}/cameras${bboxParams(bbox)}`)
 }
 
 export function postTelemetry(event: TelemetryEvent): Promise<void> {

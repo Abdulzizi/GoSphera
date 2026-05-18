@@ -19,15 +19,49 @@
           <div class="cam-fs-header">
             <span>📷 <b>{{ fullscreenCam.name }}</b>
               <span class="cam-fs-city">({{ fullscreenCam.city }})</span>
+              <span v-if="fullscreenCam.streamType === 'hls'" class="cam-fs-badge cam-fs-badge--hls">HLS</span>
+              <span v-else-if="fullscreenCam.streamType === 'mjpeg'" class="cam-fs-badge cam-fs-badge--mjpeg">MJPEG</span>
             </span>
             <div class="cam-fs-actions">
               <span class="cam-fs-live">🔴 Live</span>
               <button class="cam-fs-close" @click="closeCamFs">✕</button>
             </div>
           </div>
-          <img :src="fullscreenSrc" class="cam-fs-img" alt="Live camera feed"
-            @error="($event.target as HTMLImageElement).style.opacity = '0.2'">
-          <div class="cam-fs-footer">Auto-refreshes every 15 s · {{ fullscreenCam.city }}</div>
+
+          <!-- HLS: HTML5 video element with hls.js -->
+          <video
+            v-if="fullscreenCam.streamType === 'hls'"
+            ref="camVideoEl"
+            class="cam-fs-video"
+            autoplay muted playsinline controls
+            @error="($event.target as HTMLVideoElement).style.opacity = '0.2'"
+          />
+
+          <!-- MJPEG: browser-native multipart stream via <img> -->
+          <img
+            v-else-if="fullscreenCam.streamType === 'mjpeg'"
+            ref="camMjpegEl"
+            :src="fullscreenCam.streamUrl || fullscreenCam.url"
+            class="cam-fs-img"
+            alt="MJPEG live feed"
+            @error="($event.target as HTMLImageElement).style.opacity = '0.2'"
+          >
+
+          <!-- Snapshot: polled JPEG -->
+          <img
+            v-else
+            :src="fullscreenSrc"
+            class="cam-fs-img"
+            alt="Live camera snapshot"
+            @error="($event.target as HTMLImageElement).style.opacity = '0.2'"
+          >
+
+          <div class="cam-fs-footer">
+            <span v-if="fullscreenCam.streamType === 'hls'">HLS live stream</span>
+            <span v-else-if="fullscreenCam.streamType === 'mjpeg'">MJPEG live feed</span>
+            <span v-else>Snapshot · auto-refreshes every 5 s</span>
+            &nbsp;·&nbsp;{{ fullscreenCam.city }}
+          </div>
         </div>
       </div>
     </Teleport>
@@ -40,6 +74,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet.markercluster'
 import 'leaflet.markercluster/dist/MarkerCluster.css'
+import Hls from 'hls.js'
 import type { FeatureCollection, FireRecord, AircraftState, ShipState, CameraInfo, BBox } from '../services/api'
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
@@ -83,23 +118,62 @@ const currentZoom   = ref(2)
 const featureCount  = computed(() => props.data?.features.length ?? 0)
 
 // ── Camera fullscreen overlay ─────────────────────────────────────────────────
-const fullscreenCam = ref<{ id: string; name: string; city: string; url: string } | null>(null)
+type FsCam = { id: string; name: string; city: string; url: string; streamUrl?: string; streamType: string }
+const fullscreenCam = ref<FsCam | null>(null)
 const fullscreenSrc = ref('')
+const camVideoEl   = ref<HTMLVideoElement | null>(null)
+const camMjpegEl   = ref<HTMLImageElement | null>(null)
 let fullscreenTimer: ReturnType<typeof setInterval> | null = null
+let hlsInstance:    Hls | null = null
 
-function openCamFs(cam: { id: string; name: string; city: string; url: string }) {
+function openCamFs(cam: FsCam) {
+  // Tear down any previous session first
+  _teardownFs()
   fullscreenCam.value = cam
-  fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
-  if (fullscreenTimer) clearInterval(fullscreenTimer)
-  fullscreenTimer = setInterval(() => {
+
+  if (cam.streamType === 'hls') {
+    // HLS: attach after next tick so <video> is in the DOM
+    nextTick(() => {
+      const video = camVideoEl.value
+      if (!video) return
+      const src = cam.streamUrl || cam.url
+      if (Hls.isSupported()) {
+        hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: false })
+        hlsInstance.loadSource(src)
+        hlsInstance.attachMedia(video)
+        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari has native HLS
+        video.src = src
+        video.play().catch(() => {})
+      }
+    })
+  } else if (cam.streamType === 'mjpeg') {
+    // MJPEG: browser streams via <img> natively — src set via template binding
+    // Nothing extra needed here; teardown sets src='' to close the connection
+  } else {
+    // Snapshot: poll every 5 s
     fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
-  }, 15_000)
+    fullscreenTimer = setInterval(() => {
+      fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
+    }, 5_000)
+  }
+}
+
+/** Destroy all active stream resources without clearing fullscreenCam. */
+function _teardownFs() {
+  if (fullscreenTimer !== null) { clearInterval(fullscreenTimer); fullscreenTimer = null }
+  if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null }
+  const video = camVideoEl.value
+  if (video) { video.pause(); video.removeAttribute('src'); video.load() }
+  const mjpeg = camMjpegEl.value
+  if (mjpeg) { mjpeg.src = '' }
+  fullscreenSrc.value = ''
 }
 
 function closeCamFs() {
+  _teardownFs()
   fullscreenCam.value = null
-  fullscreenSrc.value = ''
-  if (fullscreenTimer) { clearInterval(fullscreenTimer); fullscreenTimer = null }
 }
 
 // ── Aircraft: DivIcon ✈ + RAF interpolation ───────────────────────────────────
@@ -313,7 +387,7 @@ onMounted(async () => {
 onUnmounted(() => {
   if (moveDebounce) clearTimeout(moveDebounce)
   if (rafId !== null) cancelAnimationFrame(rafId)
-  if (fullscreenTimer) clearInterval(fullscreenTimer)
+  _teardownFs()
   for (const { marker } of aircraftRegistry.values()) marker.remove()
   aircraftRegistry.clear()
   shipRegistry.clear()
@@ -421,55 +495,79 @@ watch(() => props.shipData, (states) => {
 })
 
 // ── Cameras ───────────────────────────────────────────────────────────────────
-// Popup content is generated LAZILY on popupopen — no img tags pre-allocated
-// in memory for all 65 cameras. This is the key perf fix.
+// Popup content is generated LAZILY on popupopen — no img tags pre-allocated.
+// Markers use an SVG camera-shaped icon instead of a plain dot.
+function makeCameraIcon(): L.DivIcon {
+  return L.divIcon({
+    className: '',
+    html: `<svg width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
+      <rect x="1" y="6" width="20" height="13" rx="2.5" fill="#f59e0b" stroke="#92400e" stroke-width="1.2"/>
+      <circle cx="11" cy="12.5" r="4.2" fill="#0d1117" stroke="#f59e0b" stroke-width="1.2"/>
+      <circle cx="11" cy="12.5" r="2.2" fill="#fbbf24" opacity="0.7"/>
+      <rect x="7" y="3" width="8" height="4" rx="1.2" fill="#f59e0b" stroke="#92400e" stroke-width="1"/>
+      <rect x="16.5" y="8" width="3" height="2" rx="0.6" fill="#fcd34d"/>
+    </svg>`,
+    iconSize:   [22, 22],
+    iconAnchor: [11, 11],
+    popupAnchor:[0, -13],
+  })
+}
+
 watch(() => props.cameraData, (cameras) => {
   const cluster = cameraCluster.value; if (!cluster) return
   cluster.clearLayers()
 
-  const dotIcon = L.divIcon({
-    html: `<div style="width:10px;height:10px;border-radius:50%;background:#f59e0b;border:1.5px solid #d97706;box-shadow:0 0 6px rgba(245,158,11,0.7)"></div>`,
-    className: '', iconSize: [10, 10], iconAnchor: [5, 5], popupAnchor: [0, -8],
-  })
+  const camIcon = makeCameraIcon()
 
   for (const c of cameras) {
-    const marker = L.marker([c.lat, c.lon], { icon: dotIcon })
+    const marker = L.marker([c.lat, c.lon], { icon: camIcon })
     // Bind an empty popup — content injected lazily on open
-    marker.bindPopup('', { maxWidth: 280 })
+    marker.bindPopup('', { maxWidth: 300 })
     let refreshTimer: ReturnType<typeof setInterval> | null = null
+    const streamType = c.stream_type ?? 'snapshot'
 
     marker.on('popupopen', () => {
       const ts = Date.now()
-      // Generate and inject popup content only now (no pre-allocation)
+      const streamBadge = streamType === 'hls'
+        ? `<span style="background:#1e3a2a;color:#34d399;font-size:9px;padding:2px 5px;border-radius:3px;margin-left:4px">HLS</span>`
+        : streamType === 'mjpeg'
+        ? `<span style="background:#1e2a3a;color:#60a5fa;font-size:9px;padding:2px 5px;border-radius:3px;margin-left:4px">MJPEG</span>`
+        : ''
       marker.getPopup()?.setContent(
-        `<div style="font-size:12px;min-width:220px">
-          <b>📷 ${c.name}</b> <span style="color:#888">(${c.city})</span>
+        `<div style="font-size:12px;min-width:240px">
+          <b>📷 ${c.name}</b>${streamBadge} <span style="color:#888">(${c.city})</span>
           <div style="margin-top:6px;background:#050809;border-radius:4px;overflow:hidden;min-height:60px">
             <img id="cam-prev-${c.id}" src="${c.snapshot_url}?t=${ts}"
               style="width:100%;max-height:160px;object-fit:cover;display:block"
               onerror="this.style.opacity='0.15'">
           </div>
           <button id="cam-fs-btn-${c.id}"
-            style="margin-top:6px;width:100%;padding:5px 0;background:#0d1e30;border:1px solid #1a4a6a;border-radius:4px;color:#60a5fa;cursor:pointer;font-size:11px">
-            ⛶ &nbsp;Full Screen · Live Feed
+            style="margin-top:6px;width:100%;padding:6px 0;background:#0d1e30;border:1px solid #1a4a6a;border-radius:4px;color:#60a5fa;cursor:pointer;font-size:11px;letter-spacing:0.02em">
+            ⛶ &nbsp;Full Screen · ${streamType === 'snapshot' ? 'Live Feed' : 'Live Stream'}
           </button>
         </div>`
       )
-      // Refresh preview every 5s while popup is open
-      refreshTimer = setInterval(() => {
-        const img = document.getElementById(`cam-prev-${c.id}`) as HTMLImageElement | null
-        if (img) img.src = `${c.snapshot_url}?t=${Date.now()}`
-      }, 5_000)
-      // Bind fullscreen button after DOM settles
+      // Refresh snapshot preview every 5 s while popup is open
+      if (streamType === 'snapshot') {
+        refreshTimer = setInterval(() => {
+          const img = document.getElementById(`cam-prev-${c.id}`) as HTMLImageElement | null
+          if (img) img.src = `${c.snapshot_url}?t=${Date.now()}`
+        }, 5_000)
+      }
+      // Wire fullscreen button after DOM settles
       setTimeout(() => {
         const btn = document.getElementById(`cam-fs-btn-${c.id}`)
-        if (btn) btn.onclick = () => openCamFs({ id: c.id, name: c.name, city: c.city, url: c.snapshot_url })
+        if (btn) btn.onclick = () => openCamFs({
+          id: c.id, name: c.name, city: c.city,
+          url: c.snapshot_url,
+          streamUrl: c.stream_url,
+          streamType,
+        })
       }, 80)
     })
 
     marker.on('popupclose', () => {
       if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
-      // Clear popup content so memory is freed when popup closes
       marker.getPopup()?.setContent('')
     })
 
@@ -586,13 +684,28 @@ watch(() => props.showFire, (v) => {
 }
 .cam-fs-close:hover { color: #e0eaf4; background: #1a2535; }
 
-.cam-fs-img {
+.cam-fs-img,
+.cam-fs-video {
   width: 100%;
   max-height: calc(90vh - 100px);
   object-fit: contain;
   background: #050809;
   flex: 1;
+  display: block;
 }
+
+.cam-fs-badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  vertical-align: middle;
+  letter-spacing: 0.04em;
+}
+.cam-fs-badge--hls  { background: #1e3a2a; color: #34d399; }
+.cam-fs-badge--mjpeg{ background: #1e2a3a; color: #60a5fa; }
 
 .cam-fs-footer {
   padding: 8px 16px;

@@ -122,7 +122,7 @@ async function loadShips() {
 
 async function loadCameras() {
   try {
-    cameraData.value = await getCameraData()
+    cameraData.value = await getCameraData(mapBbox.value ?? undefined)
   } catch (err) {
     console.error('[App] failed to load camera data:', err)
   }
@@ -138,6 +138,7 @@ function onBboxChange(viewport: BBox) {
   mapBbox.value = viewport.zoom >= 4 ? viewport : null
   loadAircraft()
   loadSituational()
+  loadCameras()
 }
 
 function onToggleLayer(layer: string) {
