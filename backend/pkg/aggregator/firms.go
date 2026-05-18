@@ -7,13 +7,32 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// FIRMSFeedURL is the NASA FIRMS NOAA-20 VIIRS C2 global 7-day active fire feed.
-const FIRMSFeedURL = "https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Global_7d.csv"
+// defaultFIRMSURL is the NASA FIRMS NOAA-20 VIIRS C2 global 7-day active fire feed.
+const defaultFIRMSURL = "https://firms.modaps.eosdis.nasa.gov/data/active_fire/noaa-20-viirs-c2/csv/J1_VIIRS_C2_Global_7d.csv"
+
+// firmsURL returns the configured feed URL, falling back to the default.
+func firmsURL() string {
+	if u := os.Getenv("FIRMS_URL"); u != "" {
+		return u
+	}
+	return defaultFIRMSURL
+}
+
+// firmsInterval returns the configured refresh interval, falling back to 5 minutes.
+func firmsInterval() time.Duration {
+	if s := os.Getenv("FIRMS_INTERVAL_MINUTES"); s != "" {
+		if mins, err := strconv.Atoi(s); err == nil && mins > 0 {
+			return time.Duration(mins) * time.Minute
+		}
+	}
+	return 5 * time.Minute
+}
 
 // FIRMSWorker fetches and caches NASA FIRMS fire data on a fixed interval.
 type FIRMSWorker struct {
@@ -22,12 +41,13 @@ type FIRMSWorker struct {
 	interval   time.Duration
 }
 
-// NewFIRMSWorker creates a FIRMSWorker that refreshes the cache every 5 minutes.
+// NewFIRMSWorker creates a FIRMSWorker. Interval and URL are read from env vars
+// FIRMS_INTERVAL_MINUTES and FIRMS_URL (defaults: 5 min, NASA FIRMS global feed).
 func NewFIRMSWorker(cache *Cache) *FIRMSWorker {
 	return &FIRMSWorker{
 		cache:      cache,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
-		interval:   5 * time.Minute,
+		interval:   firmsInterval(),
 	}
 }
 
@@ -51,7 +71,7 @@ func (w *FIRMSWorker) Start(ctx context.Context) {
 }
 
 func (w *FIRMSWorker) fetchAndCache(ctx context.Context) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, FIRMSFeedURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, firmsURL(), nil)
 	if err != nil {
 		fmt.Printf("[FIRMS] build request error: %v\n", err)
 		return
@@ -95,11 +115,22 @@ func (w *FIRMSWorker) ParseCSV(body io.Reader) ([]FireRecord, error) {
 		colIdx[strings.TrimSpace(name)] = i
 	}
 
-	required := []string{"latitude", "longitude", "brightness", "acq_date", "confidence"}
-	for _, col := range required {
+	// Validate mandatory columns. brightness is MODIS name; VIIRS C2 uses bright_ti4.
+	for _, col := range []string{"latitude", "longitude", "acq_date", "confidence"} {
 		if _, ok := colIdx[col]; !ok {
 			return nil, fmt.Errorf("missing required column: %s", col)
 		}
+	}
+	// Resolve brightness column name across MODIS and VIIRS variants.
+	brightnessCol := ""
+	for _, candidate := range []string{"brightness", "bright_ti4", "bright_ti5"} {
+		if _, ok := colIdx[candidate]; ok {
+			brightnessCol = candidate
+			break
+		}
+	}
+	if brightnessCol == "" {
+		return nil, fmt.Errorf("missing brightness column (expected brightness, bright_ti4, or bright_ti5)")
 	}
 
 	var records []FireRecord
@@ -121,7 +152,7 @@ func (w *FIRMSWorker) ParseCSV(body io.Reader) ([]FireRecord, error) {
 		if err != nil {
 			continue
 		}
-		brightness, err := strconv.ParseFloat(strings.TrimSpace(row[colIdx["brightness"]]), 64)
+		brightness, err := strconv.ParseFloat(strings.TrimSpace(row[colIdx[brightnessCol]]), 64)
 		if err != nil {
 			continue
 		}

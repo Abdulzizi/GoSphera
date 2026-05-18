@@ -1,115 +1,114 @@
 <template>
   <div class="globe-wrap">
-    <canvas ref="mapCanvas" class="map-canvas" />
+    <div ref="mapEl" class="map-container" />
     <div class="overlay">
-      <span v-if="!data" class="hint">Select tags and bbox, then click Query</span>
+      <span v-if="!data" class="hint">Select tags &amp; bbox, then click Query</span>
       <span v-else class="info">{{ featureCount }} features loaded</span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { shallowRef, computed, onMounted, watch } from 'vue'
+import { ref, shallowRef, computed, onMounted, onUnmounted, watch } from 'vue'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 import type { FeatureCollection } from '../services/api'
+
+// Fix Leaflet's default icon paths broken by Vite's asset pipeline.
+import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
+import markerIcon from 'leaflet/dist/images/marker-icon.png'
+import markerShadow from 'leaflet/dist/images/marker-shadow.png'
+delete (L.Icon.Default.prototype as unknown as Record<string, unknown>)._getIconUrl
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: markerIcon2x,
+  iconUrl: markerIcon,
+  shadowUrl: markerShadow,
+})
 
 const props = defineProps<{ data: FeatureCollection | null }>()
 
-// shallowRef prevents Vue from deep-proxying the canvas element,
-// keeping rendering entirely off the reactivity graph.
-const mapCanvas = shallowRef<HTMLCanvasElement | null>(null)
+const mapEl = ref<HTMLDivElement | null>(null)
+
+// shallowRef prevents Vue deep-proxying Leaflet internals —
+// keeps all rendering off the reactivity graph.
+const mapInstance = shallowRef<L.Map | null>(null)
+const geoLayer = shallowRef<L.GeoJSON | null>(null)
 
 const featureCount = computed(() => props.data?.features.length ?? 0)
 
-function drawBackground(ctx: CanvasRenderingContext2D, w: number, h: number) {
-  ctx.fillStyle = '#0d1117'
-  ctx.fillRect(0, 0, w, h)
-  // Subtle grid lines
-  ctx.strokeStyle = '#1a2030'
-  ctx.lineWidth = 0.5
-  for (let x = 0; x < w; x += 40) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke()
-  }
-  for (let y = 0; y < h; y += 40) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke()
-  }
-}
-
-function lonLatToXY(lon: number, lat: number, w: number, h: number): [number, number] {
-  return [
-    ((lon + 180) / 360) * w,
-    ((90 - lat) / 180) * h,
-  ]
-}
-
-function renderData(canvas: HTMLCanvasElement) {
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-  const { width: w, height: h } = canvas
-  drawBackground(ctx, w, h)
-
-  if (!props.data) return
-
-  for (const feature of props.data.features) {
-    const g = feature.geometry
-    if (g.type === 'Point') {
-      const [lon, lat] = g.coordinates as [number, number]
-      const [x, y] = lonLatToXY(lon, lat, w, h)
-      ctx.fillStyle = '#3a8fd4'
-      ctx.beginPath()
-      ctx.arc(x, y, 3, 0, Math.PI * 2)
-      ctx.fill()
-    } else if (g.type === 'LineString') {
-      const coords = g.coordinates as [number, number][]
-      ctx.strokeStyle = '#5ab4e5'
-      ctx.lineWidth = 1.5
-      ctx.beginPath()
-      coords.forEach(([lon, lat], i) => {
-        const [x, y] = lonLatToXY(lon, lat, w, h)
-        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
-      })
-      ctx.stroke()
-    } else if (g.type === 'Polygon') {
-      const rings = g.coordinates as [number, number][][]
-      ctx.strokeStyle = '#8fd43a'
-      ctx.fillStyle = 'rgba(143, 212, 58, 0.15)'
-      ctx.lineWidth = 1
-      for (const ring of rings) {
-        ctx.beginPath()
-        ring.forEach(([lon, lat], i) => {
-          const [x, y] = lonLatToXY(lon, lat, w, h)
-          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
-        })
-        ctx.closePath()
-        ctx.fill()
-        ctx.stroke()
-      }
-    }
-  }
-}
-
-function syncSize() {
-  const canvas = mapCanvas.value
-  if (!canvas) return
-  canvas.width = canvas.offsetWidth
-  canvas.height = canvas.offsetHeight
-}
-
 onMounted(() => {
-  syncSize()
-  const canvas = mapCanvas.value
-  if (!canvas) return
-  const ctx = canvas.getContext('2d')
-  if (ctx) drawBackground(ctx, canvas.width, canvas.height)
+  if (!mapEl.value) return
 
-  window.addEventListener('resize', () => {
-    syncSize()
-    renderData(canvas)
+  const map = L.map(mapEl.value, {
+    center: [20, 0],
+    zoom: 2,
+    preferCanvas: true, // faster for large point datasets
+    zoomControl: true,
   })
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 19,
+  }).addTo(map)
+
+  mapInstance.value = map
 })
 
-watch(() => props.data, () => {
-  if (mapCanvas.value) renderData(mapCanvas.value)
+onUnmounted(() => {
+  mapInstance.value?.remove()
+  mapInstance.value = null
 })
+
+watch(
+  () => props.data,
+  (fc) => {
+    const map = mapInstance.value
+    if (!map) return
+
+    // Remove previous layer.
+    if (geoLayer.value) {
+      geoLayer.value.remove()
+      geoLayer.value = null
+    }
+
+    if (!fc || fc.features.length === 0) return
+
+    const layer = L.geoJSON(fc as unknown as GeoJSON.FeatureCollection, {
+      style: {
+        color: '#3a8fd4',
+        weight: 1.5,
+        fillOpacity: 0.25,
+        fillColor: '#3a8fd4',
+      },
+      pointToLayer: (_feature, latlng) =>
+        L.circleMarker(latlng, {
+          radius: 5,
+          color: '#3a8fd4',
+          fillColor: '#3a8fd4',
+          fillOpacity: 0.85,
+          weight: 1,
+        }),
+      onEachFeature: (feature, layer) => {
+        const props = feature.properties ?? {}
+        const rows = Object.entries(props)
+          .filter(([k]) => !k.startsWith('osm_'))
+          .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`)
+          .join('')
+        if (rows) {
+          layer.bindPopup(`<table style="font-size:12px;border-collapse:collapse">${rows}</table>`)
+        }
+      },
+    }).addTo(map)
+
+    geoLayer.value = layer
+
+    try {
+      map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] })
+    } catch {
+      // getBounds() throws if layer has no valid bounds (e.g. empty)
+    }
+  },
+)
 </script>
 
 <style scoped>
@@ -119,22 +118,37 @@ watch(() => props.data, () => {
   background-color: #0d1117;
   overflow: hidden;
 }
-.map-canvas {
+
+.map-container {
   width: 100%;
   height: 100%;
-  display: block;
-  cursor: crosshair;
 }
+
+/* Dark tile layer tint via CSS filter */
+.map-container :deep(.leaflet-tile) {
+  filter: brightness(0.75) invert(1) hue-rotate(180deg);
+}
+
 .overlay {
   position: absolute;
   top: 12px;
-  left: 12px;
-  background: rgba(15, 20, 25, 0.85);
+  left: 50px; /* clear Leaflet zoom controls */
+  background: rgba(13, 17, 23, 0.88);
   border: 1px solid #2a3040;
   border-radius: 4px;
-  padding: 8px 12px;
+  padding: 6px 12px;
   pointer-events: none;
+  z-index: 1000;
 }
-.hint { color: #5a6a7a; font-size: 0.85rem; }
-.info { color: #3a8fd4; font-size: 0.85rem; font-weight: 600; }
+
+.hint {
+  color: #5a6a7a;
+  font-size: 0.82rem;
+}
+
+.info {
+  color: #3a8fd4;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
 </style>

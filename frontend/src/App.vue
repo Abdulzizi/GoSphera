@@ -7,19 +7,31 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import LeftPanel from './components/LeftPanel.vue'
 import MainGlobe from './components/MainGlobe.vue'
 import RightPanel from './components/RightPanel.vue'
-import { getSpatialData, getSituationalData, type FeatureCollection, type FireRecord } from './services/api'
+import {
+  getSpatialData,
+  getSituationalData,
+  openEventStream,
+  type FeatureCollection,
+  type FireRecord,
+  type TelemetryEvent,
+} from './services/api'
 
 interface QueryParams {
   tags: Array<{ key: string; value: string }>
   bbox: { minLat: number; minLon: number; maxLat: number; maxLon: number }
 }
 
+const MAX_EVENTS = 200
+
 const geoData = ref<FeatureCollection | null>(null)
-const telemetryEvents = ref<FireRecord[]>([])
+const telemetryEvents = ref<Array<FireRecord | TelemetryEvent>>([])
+
+// SSE cleanup function stored so we can call it on unmount.
+let closeStream: (() => void) | null = null
 
 async function loadSituational() {
   try {
@@ -29,7 +41,25 @@ async function loadSituational() {
   }
 }
 
-onMounted(loadSituational)
+function onTelemetryEvent(event: TelemetryEvent) {
+  // Prepend so newest events appear at the top of the right panel.
+  telemetryEvents.value.unshift(event)
+  // Cap to prevent unbounded memory growth.
+  if (telemetryEvents.value.length > MAX_EVENTS) {
+    telemetryEvents.value.length = MAX_EVENTS
+  }
+}
+
+onMounted(() => {
+  loadSituational()
+  closeStream = openEventStream(onTelemetryEvent, (err) => {
+    console.warn('[App] SSE stream error:', err)
+  })
+})
+
+onUnmounted(() => {
+  closeStream?.()
+})
 
 async function handleQuery(params: QueryParams) {
   try {

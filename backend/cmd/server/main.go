@@ -22,10 +22,16 @@ import (
 )
 
 func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
 	spatialClient := spatial.NewClient()
 	firmsCache := aggregator.NewCache()
 	firmsWorker := aggregator.NewFIRMSWorker(firmsCache)
 	pipeline := telemetry.NewPipeline(4)
+	broker := telemetry.NewEventBroker()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -36,18 +42,27 @@ func main() {
 	log.Println("[server] starting telemetry pipeline…")
 	pipeline.Start(ctx)
 
+	// Drain the processed channel and fan-out to all SSE clients.
+	go func() {
+		for event := range pipeline.GetProcessedChannel() {
+			broker.Broadcast(event)
+		}
+	}()
+
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","timestamp":"%s"}`, time.Now().Format(time.RFC3339))
+		fmt.Fprintf(w, `{"status":"ok","timestamp":"%s","sse_clients":%d}`,
+			time.Now().Format(time.RFC3339), broker.ClientCount())
 	})
 
 	r.Get("/api/spatial", handleSpatialQuery(spatialClient))
 	r.Get("/api/situational", handleSituational(firmsCache))
 	r.Post("/api/telemetry", handleTelemetryIngest(pipeline))
+	r.Get("/api/events", handleSSE(broker))
 
 	handler := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
@@ -56,17 +71,17 @@ func main() {
 	}).Handler(r)
 
 	srv := &http.Server{
-		Addr:         ":8080",
+		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 0, // SSE connections are long-lived; disable write timeout
 	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Println("[server] listening on :8080")
+		log.Printf("[server] listening on :%s\n", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[server] fatal: %v", err)
 		}
@@ -84,6 +99,45 @@ func main() {
 		log.Printf("[server] shutdown error: %v", err)
 	}
 	log.Println("[server] stopped")
+}
+
+// handleSSE streams processed TelemetryEvents to a browser EventSource.
+func handleSSE(broker *telemetry.EventBroker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		ch := broker.Subscribe()
+		defer broker.Unsubscribe(ch)
+
+		for {
+			select {
+			case event, ok := <-ch:
+				if !ok {
+					return
+				}
+				data, err := json.Marshal(event)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				flusher.Flush()
+
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}
 }
 
 // handleSpatialQuery handles GET /api/spatial?tags=k=v,k2=v2&bbox=minLat,minLon,maxLat,maxLon

@@ -57,3 +57,28 @@ export function postTelemetry(event: TelemetryEvent): Promise<void> {
     body: JSON.stringify(event),
   })
 }
+
+/**
+ * Opens a Server-Sent Events connection to /api/events.
+ * Returns a cleanup function — call it to close the stream (e.g. onUnmounted).
+ */
+export function openEventStream(
+  onEvent: (event: TelemetryEvent) => void,
+  onError?: (err: Event) => void,
+): () => void {
+  const es = new EventSource(`${API_BASE}/events`)
+
+  es.onmessage = (e: MessageEvent) => {
+    try {
+      onEvent(JSON.parse(e.data) as TelemetryEvent)
+    } catch {
+      // silently skip malformed events — never crash the stream
+    }
+  }
+
+  if (onError) {
+    es.onerror = onError
+  }
+
+  return () => es.close()
+}
