@@ -50,8 +50,11 @@ onMounted(async () => {
   const map = L.map(mapEl.value, {
     center: [20, 0],
     zoom: 2,
+    minZoom: 2,
     preferCanvas: true,
     zoomControl: false,
+    maxBounds: [[-90, -Infinity], [90, Infinity]],
+    maxBoundsViscosity: 1.0,
   })
 
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -162,6 +165,11 @@ watch(
 .map-container {
   width: 100%;
   height: 100%;
+}
+
+/* Match CartoDB dark tile background — hides white gap at max zoom-out */
+.map-container :deep(.leaflet-container) {
+  background: #0e0e10;
 }
 
 .loading-overlay {
