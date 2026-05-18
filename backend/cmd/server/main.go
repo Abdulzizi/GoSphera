@@ -180,10 +180,13 @@ func handleSpatialQuery(client *spatial.Client) http.HandlerFunc {
 	}
 }
 
-// handleSituational handles GET /api/situational?limit=N (default 500, max 5000)
+// handleSituational handles GET /api/situational?limit=N (default 500, max 5000).
+// Always sets X-Total-Count to the real cached record count before applying the limit.
 func handleSituational(cache *aggregator.Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		records := cache.GetAll()
+		w.Header().Set("X-Total-Count", strconv.Itoa(len(records)))
+
 		limit := 500
 		if s := r.URL.Query().Get("limit"); s != "" {
 			if n, err := strconv.Atoi(s); err == nil && n > 0 {

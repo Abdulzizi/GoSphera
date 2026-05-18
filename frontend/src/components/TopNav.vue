@@ -13,7 +13,11 @@
     <div class="nav-center">
       <span class="stat-chip">
         <span class="dot dot-orange" />
-        FIRMS: {{ firmsCount.toLocaleString() }} records
+        <template v-if="firmsCount === 0">FIRMS: loading…</template>
+        <template v-else-if="firmsFetched < firmsCount">
+          FIRMS: {{ firmsFetched.toLocaleString() }} of {{ firmsCount.toLocaleString() }}
+        </template>
+        <template v-else>FIRMS: {{ firmsCount.toLocaleString() }} records</template>
       </span>
       <span :class="['stat-chip', sseConnected ? 'chip-green' : 'chip-red']">
         <span :class="['dot', sseConnected ? 'dot-green dot-pulse' : 'dot-red']" />
@@ -38,6 +42,7 @@
 <script setup lang="ts">
 defineProps<{
   firmsCount: number
+  firmsFetched: number
   sseConnected: boolean
 }>()
 </script>

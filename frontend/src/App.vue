@@ -1,7 +1,8 @@
 <template>
   <div class="app-shell">
     <TopNav
-      :firms-count="firmsData.length"
+      :firms-count="firmsTotal"
+      :firms-fetched="firmsData.length"
       :sse-connected="sseConnected"
     />
     <div class="main-grid">
@@ -47,6 +48,7 @@ const MAX_EVENTS = 200
 
 const geoData = ref<FeatureCollection | null>(null)
 const firmsData = ref<FireRecord[]>([])
+const firmsTotal = ref(0)
 const liveEvents = ref<TelemetryEvent[]>([])
 const sseConnected = ref(false)
 const isLoading = ref(false)
@@ -55,7 +57,9 @@ let closeStream: (() => void) | null = null
 
 async function loadSituational() {
   try {
-    firmsData.value = await getSituationalData()
+    const { records, total } = await getSituationalData()
+    firmsData.value = records
+    firmsTotal.value = total
   } catch (err) {
     console.error('[App] failed to load situational data:', err)
   }
@@ -71,13 +75,9 @@ function onTelemetryEvent(event: TelemetryEvent) {
 onMounted(() => {
   loadSituational()
   closeStream = openEventStream(
-    (event) => {
-      sseConnected.value = true
-      onTelemetryEvent(event)
-    },
-    () => {
-      sseConnected.value = false
-    },
+    onTelemetryEvent,
+    () => { sseConnected.value = false },
+    () => { sseConnected.value = true },
   )
 })
 
