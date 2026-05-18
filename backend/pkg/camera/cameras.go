@@ -31,6 +31,38 @@ type Camera struct {
 	StreamType  string  `json:"stream_type"`           // "snapshot" | "mjpeg" | "hls"
 }
 
+// ── Live HLS cameras (verified public CDN streams) ─────────────────────────────
+//
+// These cameras serve actual HLS video via public DOT / agency CDNs.
+// All route through /api/stream/{id}/playlist.m3u8 (the Go relay proxy),
+// so CORS is handled server-side — no browser restriction ever applies.
+var hlsCameras = []Camera{
+	// Iowa DOT — live 24/7 highway intersection feeds on SkyVDN/AWS CloudFront.
+	{
+		ID: "us-ia-dubuque", Name: "US-20 @ JFK Rd", City: "Dubuque, Iowa",
+		Lat: 42.492, Lon: -90.714,
+		SnapshotURL: "", // HLS only — no static thumbnail available
+		StreamURL:   "https://iowadotsfs1.us-east-1.skyvdn.com/rtplive/dqtv17lb/playlist.m3u8",
+		StreamType:  "hls",
+	},
+	{
+		ID: "us-ia-desmoines", Name: "I-235 Expressway", City: "Des Moines, Iowa",
+		Lat: 41.596, Lon: -93.599,
+		SnapshotURL: "",
+		StreamURL:   "https://iowadotsfs2.us-east-1.skyvdn.com/rtplive/dmtv05lb/playlist.m3u8",
+		StreamType:  "hls",
+	},
+	// NASA Television — continuous public broadcast (Akamai CDN).
+	// Useful for verifying the proxy handles high-bitrate continuous streams.
+	{
+		ID: "nasa-tv-ops", Name: "NASA TV Live", City: "Cape Canaveral",
+		Lat: 28.572, Lon: -80.648,
+		SnapshotURL: "",
+		StreamURL:   "https://nasatv-lh.akamaihd.net/i/NASA_101@319270/index_1000_av-p.m3u8",
+		StreamType:  "hls",
+	},
+}
+
 // ── Camera registry ────────────────────────────────────────────────────────────
 //
 // Jakarta (Dinas Perhubungan DKI Jakarta)
@@ -134,22 +166,22 @@ func FetchAndPopulate(cache *Cache) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("[cameras] TfL fetch failed: %v — using Jakarta only\n", err)
-		cache.Set(jakartaCameras)
+		fmt.Printf("[cameras] TfL fetch failed: %v — using Jakarta + HLS only\n", err)
+		cache.Set(append(jakartaCameras, hlsCameras...))
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("[cameras] TfL returned HTTP %d — using Jakarta only\n", resp.StatusCode)
-		cache.Set(jakartaCameras)
+		fmt.Printf("[cameras] TfL returned HTTP %d — using Jakarta + HLS only\n", resp.StatusCode)
+		cache.Set(append(jakartaCameras, hlsCameras...))
 		return
 	}
 
 	var places []tflPlace
 	if err := json.NewDecoder(resp.Body).Decode(&places); err != nil {
-		fmt.Printf("[cameras] TfL parse failed: %v — using Jakarta only\n", err)
-		cache.Set(jakartaCameras)
+		fmt.Printf("[cameras] TfL parse failed: %v — using Jakarta + HLS only\n", err)
+		cache.Set(append(jakartaCameras, hlsCameras...))
 		return
 	}
 
@@ -183,6 +215,8 @@ func FetchAndPopulate(cache *Cache) {
 	}
 
 	cams = append(cams, jakartaCameras...)
+	cams = append(cams, hlsCameras...)
 	cache.Set(cams)
-	fmt.Printf("[cameras] loaded %d TfL + %d Jakarta cameras\n", len(cams)-len(jakartaCameras), len(jakartaCameras))
+	tflCount := len(cams) - len(jakartaCameras) - len(hlsCameras)
+	fmt.Printf("[cameras] loaded %d TfL + %d Jakarta + %d HLS cameras\n", tflCount, len(jakartaCameras), len(hlsCameras))
 }
