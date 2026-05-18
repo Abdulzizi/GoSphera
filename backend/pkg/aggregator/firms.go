@@ -51,12 +51,10 @@ func NewFIRMSWorker(cache *Cache) *FIRMSWorker {
 	}
 }
 
-// Start performs an immediate fetch and then repeats every w.interval until ctx is cancelled.
+// Start kicks off an immediate background fetch then repeats every w.interval until ctx is cancelled.
 func (w *FIRMSWorker) Start(ctx context.Context) {
-	// First fetch is synchronous so the cache is populated before the server starts serving.
-	w.fetchAndCache(ctx)
-
 	go func() {
+		w.fetchAndCache(ctx)
 		ticker := time.NewTicker(w.interval)
 		defer ticker.Stop()
 		for {
