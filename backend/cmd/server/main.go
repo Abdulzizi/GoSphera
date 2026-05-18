@@ -43,6 +43,7 @@ func main() {
 	aircraftWorker := aircraft.NewWorker(aircraftCache)
 	maritimeCache := maritime.NewCache()
 	maritimeWorker := maritime.NewWorker(maritimeCache)
+	cameraCache := camera.NewCache()
 	pipeline := telemetry.NewPipeline(4)
 	broker := telemetry.NewEventBroker()
 
@@ -57,6 +58,9 @@ func main() {
 
 	log.Println("[server] starting AISStream maritime worker…")
 	maritimeWorker.Start(ctx)
+
+	log.Println("[server] fetching camera list (TfL + Jakarta)…")
+	go camera.FetchAndPopulate(cameraCache)
 
 	log.Println("[server] starting telemetry pipeline…")
 	pipeline.Start(ctx)
@@ -83,7 +87,7 @@ func main() {
 	r.Get("/api/aircraft", handleAircraft(aircraftCache))
 	r.Get("/api/ships", handleShips(maritimeCache))
 	r.Get("/api/cameras", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, camera.GetAll())
+		writeJSON(w, http.StatusOK, cameraCache.GetAll())
 	})
 	r.Post("/api/telemetry", handleTelemetryIngest(pipeline))
 	r.Get("/api/events", handleSSE(broker))
