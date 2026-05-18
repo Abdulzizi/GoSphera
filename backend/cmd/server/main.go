@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/abdulzizi/gosphera/pkg/aggregator"
+	"github.com/abdulzizi/gosphera/pkg/aircraft"
 	"github.com/abdulzizi/gosphera/pkg/spatial"
 	"github.com/abdulzizi/gosphera/pkg/telemetry"
 	"github.com/go-chi/chi/v5"
@@ -30,6 +31,8 @@ func main() {
 	spatialClient := spatial.NewClient()
 	firmsCache := aggregator.NewCache()
 	firmsWorker := aggregator.NewFIRMSWorker(firmsCache)
+	aircraftCache := aircraft.NewCache()
+	aircraftWorker := aircraft.NewWorker(aircraftCache)
 	pipeline := telemetry.NewPipeline(4)
 	broker := telemetry.NewEventBroker()
 
@@ -38,6 +41,9 @@ func main() {
 
 	log.Println("[server] starting FIRMS worker…")
 	firmsWorker.Start(ctx)
+
+	log.Println("[server] starting OpenSky aircraft worker…")
+	aircraftWorker.Start(ctx)
 
 	log.Println("[server] starting telemetry pipeline…")
 	pipeline.Start(ctx)
@@ -61,6 +67,7 @@ func main() {
 
 	r.Get("/api/spatial", handleSpatialQuery(spatialClient))
 	r.Get("/api/situational", handleSituational(firmsCache))
+	r.Get("/api/aircraft", handleAircraft(aircraftCache))
 	r.Post("/api/telemetry", handleTelemetryIngest(pipeline))
 	r.Get("/api/events", handleSSE(broker))
 
@@ -200,6 +207,29 @@ func handleSituational(cache *aggregator.Cache) http.HandlerFunc {
 			records = records[:limit]
 		}
 		writeJSON(w, http.StatusOK, records)
+	}
+}
+
+// handleAircraft handles GET /api/aircraft?limit=N (default 1500, max 5000).
+// Returns live aircraft state vectors from the OpenSky cache.
+func handleAircraft(cache *aircraft.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		states := cache.GetAll()
+		w.Header().Set("X-Total-Count", strconv.Itoa(len(states)))
+
+		limit := 1500
+		if s := r.URL.Query().Get("limit"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		if limit > 5000 {
+			limit = 5000
+		}
+		if limit < len(states) {
+			states = states[:limit]
+		}
+		writeJSON(w, http.StatusOK, states)
 	}
 }
 

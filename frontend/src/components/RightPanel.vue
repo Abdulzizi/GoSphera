@@ -95,11 +95,12 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import type { FireRecord, TelemetryEvent } from '../services/api'
+import type { FireRecord, TelemetryEvent, AircraftState } from '../services/api'
 
 const props = defineProps<{
   fireRecords: FireRecord[]
   liveEvents: TelemetryEvent[]
+  aircraft: AircraftState[]
 }>()
 const emit = defineEmits<{ refresh: [] }>()
 
