@@ -60,7 +60,7 @@ export function getSpatialData(tags: string, bbox: string): Promise<FeatureColle
 }
 
 export async function getSituationalData(): Promise<{ records: FireRecord[]; total: number }> {
-  const res = await fetch(`${API_BASE}/situational`)
+  const res = await fetch(`${API_BASE}/situational`) // no limit param → backend returns all
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`API error ${res.status}: ${text}`)

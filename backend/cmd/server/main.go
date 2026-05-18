@@ -194,16 +194,13 @@ func handleSituational(cache *aggregator.Cache) http.HandlerFunc {
 		records := cache.GetAll()
 		w.Header().Set("X-Total-Count", strconv.Itoa(len(records)))
 
-		limit := 500
+		limit := 0 // 0 = all
 		if s := r.URL.Query().Get("limit"); s != "" {
 			if n, err := strconv.Atoi(s); err == nil && n > 0 {
 				limit = n
 			}
 		}
-		if limit > 5000 {
-			limit = 5000
-		}
-		if limit < len(records) {
+		if limit > 0 && limit < len(records) {
 			records = records[:limit]
 		}
 		writeJSON(w, http.StatusOK, records)

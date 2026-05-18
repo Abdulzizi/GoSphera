@@ -33,9 +33,12 @@
         <div v-else>
           <div class="summary-line">
             {{ fireRecords.length.toLocaleString() }} records
+            <span v-if="fireRecords.length > PANEL_LIMIT" class="summary-cap">
+              · showing first {{ PANEL_LIMIT.toLocaleString() }}
+            </span>
           </div>
           <div class="event-list">
-            <div v-for="(r, i) in fireRecords" :key="i" class="event-card fire-card">
+            <div v-for="(r, i) in visibleFireRecords" :key="i" class="event-card fire-card">
               <div class="card-header">
                 <span class="card-id">{{ r.latitude.toFixed(3) }}, {{ r.longitude.toFixed(3) }}</span>
                 <span :class="['conf-dot', confidenceClass(r.confidence)]" :title="r.confidence" />
@@ -109,6 +112,10 @@ const activeTab = ref<'fire' | 'live'>('fire')
 const anomalyCount = computed(() =>
   props.liveEvents.filter(ev => Boolean(ev.properties?.anomaly)).length,
 )
+
+// Cap the displayed list at 500 — the full dataset is passed to the map layer separately.
+const PANEL_LIMIT = 500
+const visibleFireRecords = computed(() => props.fireRecords.slice(0, PANEL_LIMIT))
 
 function isAnomaly(ev: TelemetryEvent): boolean {
   return Boolean(ev.properties?.anomaly)
@@ -208,6 +215,7 @@ function brightnessWidth(b: number): string {
   margin-bottom: 10px;
   padding: 0 2px;
 }
+.summary-cap { color: #3a5a6a; font-style: italic; }
 
 .empty {
   display: flex;
