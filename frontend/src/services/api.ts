@@ -46,8 +46,15 @@ export function getSpatialData(tags: string, bbox: string): Promise<FeatureColle
   return apiFetch<FeatureCollection>(`${API_BASE}/spatial?${params}`)
 }
 
-export function getSituationalData(): Promise<FireRecord[]> {
-  return apiFetch<FireRecord[]>(`${API_BASE}/situational`)
+export async function getSituationalData(): Promise<{ records: FireRecord[]; total: number }> {
+  const res = await fetch(`${API_BASE}/situational`)
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`API error ${res.status}: ${text}`)
+  }
+  const records = (await res.json()) as FireRecord[]
+  const total = parseInt(res.headers.get('X-Total-Count') ?? '0', 10)
+  return { records, total }
 }
 
 export function postTelemetry(event: TelemetryEvent): Promise<void> {
@@ -59,26 +66,47 @@ export function postTelemetry(event: TelemetryEvent): Promise<void> {
 }
 
 /**
- * Opens a Server-Sent Events connection to /api/events.
- * Returns a cleanup function — call it to close the stream (e.g. onUnmounted).
+ * Opens a Server-Sent Events connection to /api/events with auto-reconnect.
+ * Returns a cleanup function — call it to permanently close the stream (e.g. onUnmounted).
  */
 export function openEventStream(
   onEvent: (event: TelemetryEvent) => void,
   onError?: (err: Event) => void,
+  onOpen?: () => void,
 ): () => void {
-  const es = new EventSource(`${API_BASE}/events`)
+  let es: EventSource | null = null
+  let retryMs = 1_000
+  let stopped = false
 
-  es.onmessage = (e: MessageEvent) => {
-    try {
-      onEvent(JSON.parse(e.data) as TelemetryEvent)
-    } catch {
-      // silently skip malformed events — never crash the stream
+  function connect() {
+    es = new EventSource(`${API_BASE}/events`)
+
+    es.onopen = () => {
+      retryMs = 1_000  // reset backoff on successful open
+      onOpen?.()
+    }
+
+    es.onmessage = (e: MessageEvent) => {
+      try {
+        onEvent(JSON.parse(e.data) as TelemetryEvent)
+      } catch {
+        // silently skip malformed events
+      }
+    }
+
+    es.onerror = (err: Event) => {
+      onError?.(err)
+      es?.close()
+      if (!stopped) {
+        setTimeout(connect, retryMs)
+        retryMs = Math.min(retryMs * 2, 30_000)  // cap backoff at 30s
+      }
     }
   }
 
-  if (onError) {
-    es.onerror = onError
+  connect()
+  return () => {
+    stopped = true
+    es?.close()
   }
-
-  return () => es.close()
 }
