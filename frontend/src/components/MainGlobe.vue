@@ -123,13 +123,10 @@ function makePlaneIcon(heading: number, onGround: boolean): L.DivIcon {
   })
 }
 
-// ── Ships: vessel-shaped DivIcon + markerClusterGroup + RAF ───────────────────
-type ShipEntry = {
-  marker: L.Marker
-  fromLat: number; fromLon: number
-  toLat:   number; toLon:   number
-  startTime: number
-}
+// ── Ships: vessel-shaped DivIcon + markerClusterGroup ────────────────────────
+// Ships move at 5–10 m/s — no RAF interpolation needed (sub-pixel per frame).
+// Positions are snapped directly on each 15s poll.
+type ShipEntry = { marker: L.Marker }
 const shipRegistry = new Map<number, ShipEntry>()
 
 function makeShipIcon(heading: number): L.DivIcon {
@@ -159,17 +156,13 @@ function makeCountCluster(count: number, hex: string): L.DivIcon {
   })
 }
 
-// ── Combined RAF tick: aircraft + ships ───────────────────────────────────────
-function tickMovers(now: number) {
+// ── RAF tick: aircraft only (ships are too slow to need per-frame lerp) ───────
+function tickAircraft(now: number) {
   for (const e of aircraftRegistry.values()) {
     const t = Math.min(1, (now - e.startTime) / INTERP_MS)
     e.marker.setLatLng([e.fromLat + (e.toLat - e.fromLat) * t, e.fromLon + (e.toLon - e.fromLon) * t])
   }
-  for (const e of shipRegistry.values()) {
-    const t = Math.min(1, (now - e.startTime) / INTERP_MS)
-    e.marker.setLatLng([e.fromLat + (e.toLat - e.fromLat) * t, e.fromLon + (e.toLon - e.fromLon) * t])
-  }
-  rafId = requestAnimationFrame(tickMovers)
+  rafId = requestAnimationFrame(tickAircraft)
 }
 
 // ── Tile definitions ───────────────────────────────────────────────────────────
@@ -314,7 +307,7 @@ onMounted(async () => {
   })
 
   setTimeout(() => emitCurrentBounds(map), 300)
-  rafId = requestAnimationFrame(tickMovers)
+  rafId = requestAnimationFrame(tickAircraft)
 })
 
 onUnmounted(() => {
@@ -323,7 +316,6 @@ onUnmounted(() => {
   if (fullscreenTimer) clearInterval(fullscreenTimer)
   for (const { marker } of aircraftRegistry.values()) marker.remove()
   aircraftRegistry.clear()
-  for (const { marker } of shipRegistry.values()) marker.remove()
   shipRegistry.clear()
   shipCluster.value?.clearLayers()
   cameraCluster.value?.clearLayers()
@@ -406,10 +398,8 @@ watch(() => props.shipData, (states) => {
     seen.add(s.mmsi)
     const ex = shipRegistry.get(s.mmsi)
     if (ex) {
-      const cur = ex.marker.getLatLng()
-      ex.fromLat = cur.lat; ex.fromLon = cur.lng
-      ex.toLat = s.lat; ex.toLon = s.lon
-      ex.startTime = performance.now()
+      // Snap to new position on poll — ships are too slow to need interpolation
+      ex.marker.setLatLng([s.lat, s.lon])
       ex.marker.setIcon(makeShipIcon(s.heading))
     } else {
       const marker = L.marker([s.lat, s.lon], { icon: makeShipIcon(s.heading) })
@@ -422,7 +412,7 @@ watch(() => props.shipData, (states) => {
           <b>Heading:</b> ${Math.round(s.heading)}°
         </div>`, { maxWidth: 200 })
       cluster.addLayer(marker)
-      shipRegistry.set(s.mmsi, { marker, fromLat: s.lat, fromLon: s.lon, toLat: s.lat, toLon: s.lon, startTime: performance.now() })
+      shipRegistry.set(s.mmsi, { marker })
     }
   }
   for (const [id, e] of shipRegistry) {
@@ -431,53 +421,56 @@ watch(() => props.shipData, (states) => {
 })
 
 // ── Cameras ───────────────────────────────────────────────────────────────────
+// Popup content is generated LAZILY on popupopen — no img tags pre-allocated
+// in memory for all 65 cameras. This is the key perf fix.
 watch(() => props.cameraData, (cameras) => {
   const cluster = cameraCluster.value; if (!cluster) return
   cluster.clearLayers()
 
+  const dotIcon = L.divIcon({
+    html: `<div style="width:10px;height:10px;border-radius:50%;background:#f59e0b;border:1.5px solid #d97706;box-shadow:0 0 6px rgba(245,158,11,0.7)"></div>`,
+    className: '', iconSize: [10, 10], iconAnchor: [5, 5], popupAnchor: [0, -8],
+  })
+
   for (const c of cameras) {
-    const dotIcon = L.divIcon({
-      html: `<div style="width:10px;height:10px;border-radius:50%;background:#f59e0b;border:1.5px solid #d97706;box-shadow:0 0 6px rgba(245,158,11,0.7)"></div>`,
-      className: '', iconSize: [10, 10], iconAnchor: [5, 5], popupAnchor: [0, -8],
-    })
     const marker = L.marker([c.lat, c.lon], { icon: dotIcon })
+    // Bind an empty popup — content injected lazily on open
+    marker.bindPopup('', { maxWidth: 280 })
     let refreshTimer: ReturnType<typeof setInterval> | null = null
 
-    marker.bindPopup(
-      `<div style="font-size:12px;min-width:220px">
-        <b>📷 ${c.name}</b> <span style="color:#888">(${c.city})</span>
-        <div style="margin-top:6px;position:relative;background:#050809;border-radius:4px;overflow:hidden;min-height:80px">
-          <img id="cam-prev-${c.id}"
-            src="${c.snapshot_url}?t=${Date.now()}"
-            style="width:100%;max-height:160px;object-fit:cover;display:block"
-            loading="lazy"
-            onerror="this.style.opacity='0.15'">
-        </div>
-        <button id="cam-fs-btn-${c.id}"
-          style="margin-top:6px;width:100%;padding:5px 0;background:#0d1e30;border:1px solid #1a4a6a;border-radius:4px;color:#60a5fa;cursor:pointer;font-size:11px;transition:background 0.15s"
-          onmouseover="this.style.background='#142840'"
-          onmouseout="this.style.background='#0d1e30'">
-          ⛶ &nbsp;Full Screen · Live Feed
-        </button>
-      </div>`,
-      { maxWidth: 280 },
-    )
-
     marker.on('popupopen', () => {
-      // Auto-refresh preview image every 15s
+      const ts = Date.now()
+      // Generate and inject popup content only now (no pre-allocation)
+      marker.getPopup()?.setContent(
+        `<div style="font-size:12px;min-width:220px">
+          <b>📷 ${c.name}</b> <span style="color:#888">(${c.city})</span>
+          <div style="margin-top:6px;background:#050809;border-radius:4px;overflow:hidden;min-height:60px">
+            <img id="cam-prev-${c.id}" src="${c.snapshot_url}?t=${ts}"
+              style="width:100%;max-height:160px;object-fit:cover;display:block"
+              onerror="this.style.opacity='0.15'">
+          </div>
+          <button id="cam-fs-btn-${c.id}"
+            style="margin-top:6px;width:100%;padding:5px 0;background:#0d1e30;border:1px solid #1a4a6a;border-radius:4px;color:#60a5fa;cursor:pointer;font-size:11px">
+            ⛶ &nbsp;Full Screen · Live Feed
+          </button>
+        </div>`
+      )
+      // Refresh preview every 5s while popup is open
       refreshTimer = setInterval(() => {
         const img = document.getElementById(`cam-prev-${c.id}`) as HTMLImageElement | null
         if (img) img.src = `${c.snapshot_url}?t=${Date.now()}`
-      }, 15_000)
+      }, 5_000)
       // Bind fullscreen button after DOM settles
       setTimeout(() => {
         const btn = document.getElementById(`cam-fs-btn-${c.id}`)
         if (btn) btn.onclick = () => openCamFs({ id: c.id, name: c.name, city: c.city, url: c.snapshot_url })
-      }, 60)
+      }, 80)
     })
 
     marker.on('popupclose', () => {
       if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+      // Clear popup content so memory is freed when popup closes
+      marker.getPopup()?.setContent('')
     })
 
     cluster.addLayer(marker)
