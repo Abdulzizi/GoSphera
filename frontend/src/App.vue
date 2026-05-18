@@ -4,6 +4,9 @@
       :firms-count="firmsTotal"
       :firms-fetched="firmsData.length"
       :sse-connected="sseConnected"
+      :aircraft-count="aircraftData.length"
+      :map-style="mapStyle"
+      @style-change="mapStyle = $event"
     />
     <div class="main-grid">
       <LeftPanel
@@ -13,11 +16,14 @@
       <MainGlobe
         :data="geoData"
         :fire-data="firmsData"
+        :aircraft-data="aircraftData"
         :is-loading="isLoading"
+        :map-style="mapStyle"
       />
       <RightPanel
         :fire-records="firmsData"
         :live-events="liveEvents"
+        :aircraft="aircraftData"
         @refresh="loadSituational"
       />
     </div>
@@ -33,10 +39,12 @@ import RightPanel from './components/RightPanel.vue'
 import {
   getSpatialData,
   getSituationalData,
+  getAircraftData,
   openEventStream,
   type FeatureCollection,
   type FireRecord,
   type TelemetryEvent,
+  type AircraftState,
 } from './services/api'
 
 interface QueryParams {
@@ -46,14 +54,17 @@ interface QueryParams {
 
 const MAX_EVENTS = 200
 
-const geoData = ref<FeatureCollection | null>(null)
-const firmsData = ref<FireRecord[]>([])
-const firmsTotal = ref(0)
-const liveEvents = ref<TelemetryEvent[]>([])
-const sseConnected = ref(false)
-const isLoading = ref(false)
+const geoData        = ref<FeatureCollection | null>(null)
+const firmsData      = ref<FireRecord[]>([])
+const firmsTotal     = ref(0)
+const liveEvents     = ref<TelemetryEvent[]>([])
+const aircraftData   = ref<AircraftState[]>([])
+const sseConnected   = ref(false)
+const isLoading      = ref(false)
+const mapStyle       = ref<'dark' | 'light' | 'satellite'>('dark')
 
 let closeStream: (() => void) | null = null
+let aircraftTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadSituational() {
   try {
@@ -62,6 +73,14 @@ async function loadSituational() {
     firmsTotal.value = total
   } catch (err) {
     console.error('[App] failed to load situational data:', err)
+  }
+}
+
+async function loadAircraft() {
+  try {
+    aircraftData.value = await getAircraftData()
+  } catch (err) {
+    console.error('[App] failed to load aircraft data:', err)
   }
 }
 
@@ -74,6 +93,10 @@ function onTelemetryEvent(event: TelemetryEvent) {
 
 onMounted(() => {
   loadSituational()
+  loadAircraft()
+  // Poll aircraft every 15 s (respects OpenSky anonymous rate limit)
+  aircraftTimer = setInterval(loadAircraft, 15_000)
+
   closeStream = openEventStream(
     onTelemetryEvent,
     () => { sseConnected.value = false },
@@ -83,6 +106,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   closeStream?.()
+  if (aircraftTimer) clearInterval(aircraftTimer)
 })
 
 async function handleQuery(params: QueryParams) {

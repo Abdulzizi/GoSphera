@@ -22,6 +22,19 @@ export interface FireRecord {
   confidence: string
 }
 
+export interface AircraftState {
+  icao24: string
+  callsign: string
+  country: string
+  lat: number
+  lon: number
+  altitude: number   // metres
+  velocity: number   // m/s
+  heading: number    // degrees clockwise from north
+  on_ground: boolean
+  last_contact: number
+}
+
 export interface TelemetryEvent {
   id: string
   timestamp: string
@@ -55,6 +68,10 @@ export async function getSituationalData(): Promise<{ records: FireRecord[]; tot
   const records = (await res.json()) as FireRecord[]
   const total = parseInt(res.headers.get('X-Total-Count') ?? '0', 10)
   return { records, total }
+}
+
+export function getAircraftData(): Promise<AircraftState[]> {
+  return apiFetch<AircraftState[]>(`${API_BASE}/aircraft`)
 }
 
 export function postTelemetry(event: TelemetryEvent): Promise<void> {
