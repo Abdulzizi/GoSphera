@@ -61,10 +61,11 @@ func (w *Worker) runLoop(ctx context.Context) {
 }
 
 // subscribeMsg is sent to AISStream after connecting to request position reports.
+// BoundingBoxes format: [ [ [minLat, minLon], [maxLat, maxLon] ], … ]
 type subscribeMsg struct {
-	APIKey       string      `json:"APIKey"`
-	BoundingBoxes [][]float64 `json:"BoundingBoxes"`
-	FilterMessageTypes []string `json:"FilterMessageTypes"`
+	APIKey             string         `json:"APIKey"`
+	BoundingBoxes      [][2][2]float64 `json:"BoundingBoxes"`
+	FilterMessageTypes []string        `json:"FilterMessageTypes"`
 }
 
 // aismsg is the envelope for every message AISStream sends.
@@ -99,8 +100,8 @@ func (w *Worker) connect(ctx context.Context) error {
 
 	sub := subscribeMsg{
 		APIKey: w.apiKey,
-		// Single global bounding box: [minLat, minLon, maxLat, maxLon]
-		BoundingBoxes: [][]float64{{-90, -180, 90, 180}},
+		// Global bounding box: [[minLat, minLon], [maxLat, maxLon]]
+		BoundingBoxes:      [][2][2]float64{{{-90, -180}, {90, 180}}},
 		FilterMessageTypes: []string{"PositionReport"},
 	}
 	if err := conn.WriteJSON(sub); err != nil {
