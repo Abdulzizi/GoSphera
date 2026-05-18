@@ -43,16 +43,41 @@ export interface TelemetryEvent {
   properties: Record<string, unknown>
 }
 
-const API_BASE = '/api'
+export interface ShipState {
+  mmsi: number
+  name: string
+  lat: number
+  lon: number
+  speed: number    // knots
+  heading: number  // degrees
+  ship_type: number
+  last_seen: number // unix seconds
+}
 
-/** Viewport bounding box — passed as query params to spatially filter backend responses. */
+export interface CameraInfo {
+  id: string
+  name: string
+  city: string
+  lat: number
+  lon: number
+  snapshot_url: string
+}
+
+/**
+ * Viewport bounding box with zoom level.
+ * zoom is frontend-only — not sent to backend; only lat/lon bounds are transmitted.
+ */
 export interface BBox {
   minLat: number
   minLon: number
   maxLat: number
   maxLon: number
+  zoom: number
 }
 
+const API_BASE = '/api'
+
+/** Build `?minLat=…&minLon=…&maxLat=…&maxLon=…` — zoom is excluded (not a backend param). */
 function bboxParams(bbox?: BBox): string {
   if (!bbox) return ''
   const p = new URLSearchParams({
@@ -78,6 +103,10 @@ export function getSpatialData(tags: string, bbox: string): Promise<FeatureColle
   return apiFetch<FeatureCollection>(`${API_BASE}/spatial?${params}`)
 }
 
+/**
+ * Fetch FIRMS fire records.
+ * Pass bbox only when zoom >= 4 to avoid fetching 200k+ records at global zoom.
+ */
 export async function getSituationalData(bbox?: BBox): Promise<{ records: FireRecord[]; total: number }> {
   const res = await fetch(`${API_BASE}/situational${bboxParams(bbox)}`)
   if (!res.ok) {
@@ -89,8 +118,17 @@ export async function getSituationalData(bbox?: BBox): Promise<{ records: FireRe
   return { records, total }
 }
 
+/** Fetch aircraft — pass bbox only when zoom >= 4. */
 export function getAircraftData(bbox?: BBox): Promise<AircraftState[]> {
   return apiFetch<AircraftState[]>(`${API_BASE}/aircraft${bboxParams(bbox)}`)
+}
+
+export function getShipData(): Promise<ShipState[]> {
+  return apiFetch<ShipState[]>(`${API_BASE}/ships`)
+}
+
+export function getCameraData(): Promise<CameraInfo[]> {
+  return apiFetch<CameraInfo[]>(`${API_BASE}/cameras`)
 }
 
 export function postTelemetry(event: TelemetryEvent): Promise<void> {
@@ -118,7 +156,7 @@ export function openEventStream(
     es = new EventSource(`${API_BASE}/events`)
 
     es.onopen = () => {
-      retryMs = 1_000  // reset backoff on successful open
+      retryMs = 1_000
       onOpen?.()
     }
 
@@ -135,7 +173,7 @@ export function openEventStream(
       es?.close()
       if (!stopped) {
         setTimeout(connect, retryMs)
-        retryMs = Math.min(retryMs * 2, 30_000)  // cap backoff at 30s
+        retryMs = Math.min(retryMs * 2, 30_000)
       }
     }
   }

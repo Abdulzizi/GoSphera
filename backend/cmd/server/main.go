@@ -15,6 +15,8 @@ import (
 
 	"github.com/abdulzizi/gosphera/pkg/aggregator"
 	"github.com/abdulzizi/gosphera/pkg/aircraft"
+	"github.com/abdulzizi/gosphera/pkg/camera"
+	"github.com/abdulzizi/gosphera/pkg/maritime"
 	"github.com/abdulzizi/gosphera/pkg/spatial"
 	"github.com/abdulzizi/gosphera/pkg/telemetry"
 	"github.com/go-chi/chi/v5"
@@ -33,6 +35,8 @@ func main() {
 	firmsWorker := aggregator.NewFIRMSWorker(firmsCache)
 	aircraftCache := aircraft.NewCache()
 	aircraftWorker := aircraft.NewWorker(aircraftCache)
+	maritimeCache := maritime.NewCache()
+	maritimeWorker := maritime.NewWorker(maritimeCache)
 	pipeline := telemetry.NewPipeline(4)
 	broker := telemetry.NewEventBroker()
 
@@ -44,6 +48,9 @@ func main() {
 
 	log.Println("[server] starting OpenSky aircraft worker…")
 	aircraftWorker.Start(ctx)
+
+	log.Println("[server] starting AISStream maritime worker…")
+	maritimeWorker.Start(ctx)
 
 	log.Println("[server] starting telemetry pipeline…")
 	pipeline.Start(ctx)
@@ -68,6 +75,10 @@ func main() {
 	r.Get("/api/spatial", handleSpatialQuery(spatialClient))
 	r.Get("/api/situational", handleSituational(firmsCache))
 	r.Get("/api/aircraft", handleAircraft(aircraftCache))
+	r.Get("/api/ships", handleShips(maritimeCache))
+	r.Get("/api/cameras", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, camera.GetAll())
+	})
 	r.Post("/api/telemetry", handleTelemetryIngest(pipeline))
 	r.Get("/api/events", handleSSE(broker))
 
@@ -274,6 +285,15 @@ func handleAircraft(cache *aircraft.Cache) http.HandlerFunc {
 			}
 		}
 
+		writeJSON(w, http.StatusOK, states)
+	}
+}
+
+// handleShips handles GET /api/ships — returns all cached AIS ship states.
+func handleShips(cache *maritime.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		states := cache.GetAll()
+		w.Header().Set("X-Total-Count", strconv.Itoa(len(states)))
 		writeJSON(w, http.StatusOK, states)
 	}
 }

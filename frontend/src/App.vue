@@ -5,8 +5,14 @@
       :firms-fetched="firmsData.length"
       :sse-connected="sseConnected"
       :aircraft-count="aircraftData.length"
+      :ship-count="shipData.length"
       :map-style="mapStyle"
+      :show-aircraft="showAircraft"
+      :show-ships="showShips"
+      :show-cameras="showCameras"
+      :show-fire="showFire"
       @style-change="mapStyle = $event"
+      @toggle-layer="onToggleLayer"
     />
     <div class="main-grid">
       <LeftPanel
@@ -17,8 +23,14 @@
         :data="geoData"
         :fire-data="firmsData"
         :aircraft-data="aircraftData"
+        :ship-data="shipData"
+        :camera-data="cameraData"
         :is-loading="isLoading"
         :map-style="mapStyle"
+        :show-aircraft="showAircraft"
+        :show-ships="showShips"
+        :show-cameras="showCameras"
+        :show-fire="showFire"
         @bbox-change="onBboxChange"
       />
       <RightPanel
@@ -41,12 +53,16 @@ import {
   getSpatialData,
   getSituationalData,
   getAircraftData,
+  getShipData,
+  getCameraData,
   openEventStream,
   type BBox,
   type FeatureCollection,
   type FireRecord,
   type TelemetryEvent,
   type AircraftState,
+  type ShipState,
+  type CameraInfo,
 } from './services/api'
 
 interface QueryParams {
@@ -56,18 +72,27 @@ interface QueryParams {
 
 const MAX_EVENTS = 200
 
-const geoData       = ref<FeatureCollection | null>(null)
-const firmsData     = ref<FireRecord[]>([])
-const firmsTotal    = ref(0)
-const liveEvents    = ref<TelemetryEvent[]>([])
-const aircraftData  = ref<AircraftState[]>([])
-const sseConnected  = ref(false)
-const isLoading     = ref(false)
-const mapStyle      = ref<'dark' | 'light' | 'satellite'>('dark')
-const mapBbox       = ref<BBox | null>(null)
+const geoData      = ref<FeatureCollection | null>(null)
+const firmsData    = ref<FireRecord[]>([])
+const firmsTotal   = ref(0)
+const liveEvents   = ref<TelemetryEvent[]>([])
+const aircraftData = ref<AircraftState[]>([])
+const shipData     = ref<ShipState[]>([])
+const cameraData   = ref<CameraInfo[]>([])
+const sseConnected = ref(false)
+const isLoading    = ref(false)
+const mapStyle     = ref<'dark' | 'light' | 'satellite'>('dark')
+const mapBbox      = ref<BBox | null>(null)
+
+// Layer visibility — all on by default
+const showAircraft = ref(true)
+const showShips    = ref(true)
+const showCameras  = ref(true)
+const showFire     = ref(true)
 
 let closeStream:   (() => void) | null = null
 let aircraftTimer: ReturnType<typeof setInterval> | null = null
+let shipTimer:     ReturnType<typeof setInterval> | null = null
 
 async function loadSituational() {
   try {
@@ -87,12 +112,39 @@ async function loadAircraft() {
   }
 }
 
-/** Called by MainGlobe on moveend (debounced 400ms) and once on initial load. */
-function onBboxChange(bbox: BBox) {
-  mapBbox.value = bbox
-  // Reload both layers with the new viewport bbox
+async function loadShips() {
+  try {
+    shipData.value = await getShipData()
+  } catch (err) {
+    console.error('[App] failed to load ship data:', err)
+  }
+}
+
+async function loadCameras() {
+  try {
+    cameraData.value = await getCameraData()
+  } catch (err) {
+    console.error('[App] failed to load camera data:', err)
+  }
+}
+
+/**
+ * Called by MainGlobe on moveend (debounced 400ms) and once on initial load.
+ * Only passes bbox to the API when zoom >= 4 — at global zoom the bbox covers
+ * the whole world so the filter returns all 200k+ records unchanged.
+ * At zoom < 4 we let the backend use its 5000-record default cap instead.
+ */
+function onBboxChange(viewport: BBox) {
+  mapBbox.value = viewport.zoom >= 4 ? viewport : null
   loadAircraft()
   loadSituational()
+}
+
+function onToggleLayer(layer: string) {
+  if (layer === 'aircraft') showAircraft.value = !showAircraft.value
+  else if (layer === 'ships')   showShips.value    = !showShips.value
+  else if (layer === 'cameras') showCameras.value  = !showCameras.value
+  else if (layer === 'fire')    showFire.value     = !showFire.value
 }
 
 function onTelemetryEvent(event: TelemetryEvent) {
@@ -103,13 +155,17 @@ function onTelemetryEvent(event: TelemetryEvent) {
 }
 
 onMounted(() => {
-  // Initial loads run without bbox (bbox=null → backend caps at 5000)
-  // The map emits bbox ~300ms after mount, triggering a filtered reload
+  // Initial loads without bbox (bbox=null → backend caps at 5000)
+  // Map emits bbox ~300ms after mount, triggering a viewport-filtered reload
   loadSituational()
   loadAircraft()
+  loadShips()
+  loadCameras()  // static list, no polling needed
 
-  // Continue polling every 15s for new data within the current viewport
+  // Poll aircraft every 15s for new positions within current viewport
   aircraftTimer = setInterval(loadAircraft, 15_000)
+  // Poll ships every 15s (AISStream updates continuously on backend)
+  shipTimer = setInterval(loadShips, 15_000)
 
   closeStream = openEventStream(
     onTelemetryEvent,
@@ -121,6 +177,7 @@ onMounted(() => {
 onUnmounted(() => {
   closeStream?.()
   if (aircraftTimer) clearInterval(aircraftTimer)
+  if (shipTimer)     clearInterval(shipTimer)
 })
 
 async function handleQuery(params: QueryParams) {

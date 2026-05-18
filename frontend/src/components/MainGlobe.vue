@@ -18,7 +18,7 @@
 import { ref, shallowRef, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import type { FeatureCollection, FireRecord, AircraftState, BBox } from '../services/api'
+import type { FeatureCollection, FireRecord, AircraftState, ShipState, CameraInfo, BBox } from '../services/api'
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon   from 'leaflet/dist/images/marker-icon.png'
@@ -32,12 +32,18 @@ const props = defineProps<{
   data:         FeatureCollection | null
   fireData:     FireRecord[]
   aircraftData: AircraftState[]
+  shipData:     ShipState[]
+  cameraData:   CameraInfo[]
   isLoading:    boolean
   mapStyle:     MapStyle
+  showAircraft: boolean
+  showShips:    boolean
+  showCameras:  boolean
+  showFire:     boolean
 }>()
 
 const emit = defineEmits<{
-  'bbox-change': [bbox: BBox]
+  'bbox-change': [viewport: BBox]
 }>()
 
 // ── Refs ───────────────────────────────────────────────────────────────────────
@@ -46,21 +52,34 @@ const mapInstance = shallowRef<L.Map | null>(null)
 const tileLayer   = shallowRef<L.TileLayer | null>(null)
 const geoLayer    = shallowRef<L.GeoJSON | null>(null)
 const fireLayer   = shallowRef<L.LayerGroup | null>(null)
+const cameraLayer = shallowRef<L.LayerGroup | null>(null)
+const currentZoom = ref(2)
 
 const featureCount = computed(() => props.data?.features.length ?? 0)
 
-// ── Aircraft: canvas circleMarker registry + RAF smooth interpolation ──────────
+// ── Aircraft: DivIcon ✈ registry + RAF smooth interpolation ───────────────────
+// Shown only at zoom >= 4 (prevents 8k DOM nodes at global view)
 type AircraftEntry = {
-  marker:    L.CircleMarker
-  fromLat:   number
-  fromLon:   number
-  toLat:     number
-  toLon:     number
+  marker:    L.Marker
+  fromLat:   number; fromLon:   number
+  toLat:     number; toLon:     number
   startTime: number
 }
 const aircraftRegistry = new Map<string, AircraftEntry>()
 let rafId: number | null = null
-const INTERP_MS = 14_000 // slightly less than 15s poll interval
+const INTERP_MS = 14_000
+
+function makePlaneIcon(heading: number, onGround: boolean): L.DivIcon {
+  const color  = onGround ? '#9ca3af' : '#60a5fa'
+  const shadow = onGround ? 'none'    : '0 0 5px rgba(96,165,250,0.7)'
+  return L.divIcon({
+    html: `<div style="transform:rotate(${heading}deg);color:${color};font-size:14px;line-height:1;text-shadow:${shadow};user-select:none;width:14px;height:14px;display:flex;align-items:center;justify-content:center">✈</div>`,
+    className: '',
+    iconSize:    [14, 14],
+    iconAnchor:  [7, 7],
+    popupAnchor: [0, -10],
+  })
+}
 
 function tickAircraft(now: number) {
   for (const entry of aircraftRegistry.values()) {
@@ -71,6 +90,15 @@ function tickAircraft(now: number) {
   }
   rafId = requestAnimationFrame(tickAircraft)
 }
+
+// ── Ships: canvas circleMarker registry + RAF ──────────────────────────────────
+type ShipEntry = {
+  marker:    L.CircleMarker
+  fromLat:   number; fromLon:   number
+  toLat:     number; toLon:     number
+  startTime: number
+}
+const shipRegistry = new Map<number, ShipEntry>()
 
 // ── Tile definitions ───────────────────────────────────────────────────────────
 const tileDefs: Record<MapStyle, { url: string; options: L.TileLayerOptions }> = {
@@ -97,21 +125,22 @@ const tileDefs: Record<MapStyle, { url: string; options: L.TileLayerOptions }> =
   },
 }
 
+// ── Formatters ─────────────────────────────────────────────────────────────────
 function fmtAlt(m: number): string {
-  if (!m) return 'n/a'
-  return `${Math.round(m).toLocaleString()} m (${Math.round(m * 3.28084).toLocaleString()} ft)`
+  return m ? `${Math.round(m).toLocaleString()} m (${Math.round(m * 3.28084).toLocaleString()} ft)` : 'n/a'
 }
 function fmtSpeed(ms: number): string {
-  if (!ms) return 'n/a'
-  return `${Math.round(ms)} m/s (${Math.round(ms * 1.944)} kts)`
+  return ms ? `${Math.round(ms)} m/s (${Math.round(ms * 1.944)} kts)` : 'n/a'
+}
+function fmtKnots(kts: number): string {
+  return kts ? `${kts.toFixed(1)} kts` : 'n/a'
 }
 
-// ── Zoom-adaptive FIRMS downsampling (no external library) ─────────────────────
-// At low zoom, merge nearby fire dots into a single representative point using a
-// spatial hash grid.  Grid cell size shrinks as zoom increases → full detail at z7+.
+// ── Zoom-adaptive FIRMS downsampling ──────────────────────────────────────────
+// Grid-cell spatial hash: at low zoom, keep one representative point per cell.
+// cellDeg at z2 ≈ 3.2°, at z6 ≈ 0.2°, at z7+ full resolution.
 function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
   if (zoom >= 7) return records
-  // cellDeg: ~3.2° at z2 → ~0.1° at z6
   const cellDeg = Math.pow(2, 7 - zoom) * 0.05
   const grid = new Map<string, FireRecord>()
   for (const r of records) {
@@ -121,7 +150,6 @@ function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
   return Array.from(grid.values())
 }
 
-// Extracted fire render — called on data change AND on zoomend
 function renderFireLayer() {
   const map = mapInstance.value
   if (!map) return
@@ -129,21 +157,19 @@ function renderFireLayer() {
   fireLayer.value = null
   if (!props.fireData?.length) return
 
-  const zoom = map.getZoom()
-  const sampled = downsampleFire(props.fireData, zoom)
-
+  const sampled = downsampleFire(props.fireData, currentZoom.value)
   const group = L.layerGroup()
   for (const r of sampled) {
     L.circleMarker([r.latitude, r.longitude], {
       radius: 4, color: '#f97316', fillColor: '#f97316', fillOpacity: 0.7, weight: 0.5,
     })
       .bindPopup(
-        `<b>Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>` +
+        `<b>🔥 Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>` +
         `Confidence: ${r.confidence}<br>Date: ${r.acq_date}`,
       )
       .addTo(group)
   }
-  group.addTo(map)
+  if (props.showFire) group.addTo(map)
   fireLayer.value = group
 }
 
@@ -152,12 +178,22 @@ let moveDebounce: ReturnType<typeof setTimeout> | null = null
 
 function emitCurrentBounds(map: L.Map) {
   const b = map.getBounds()
+  const zoom = map.getZoom()
   emit('bbox-change', {
-    minLat: b.getSouth(),
-    minLon: b.getWest(),
-    maxLat: b.getNorth(),
-    maxLon: b.getEast(),
+    minLat: b.getSouth(), minLon: b.getWest(),
+    maxLat: b.getNorth(), maxLon: b.getEast(),
+    zoom,
   })
+}
+
+// ── Aircraft zoom visibility ────────────────────────────────────────────────────
+// At zoom < 4 the entire globe is visible — hiding aircraft avoids 8k DOM nodes.
+function syncAircraftVisibility(map: L.Map) {
+  const show = currentZoom.value >= 4 && props.showAircraft
+  for (const { marker } of aircraftRegistry.values()) {
+    if (show && !map.hasLayer(marker)) marker.addTo(map)
+    else if (!show && map.hasLayer(marker)) marker.remove()
+  }
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────────
@@ -181,19 +217,22 @@ onMounted(async () => {
   map.invalidateSize(true)
   mapInstance.value = map
 
-  // Emit viewport bbox after pan/zoom — debounced to avoid rapid-fire fetches
+  // Debounced bbox emit on pan
   map.on('moveend', () => {
     if (moveDebounce) clearTimeout(moveDebounce)
     moveDebounce = setTimeout(() => emitCurrentBounds(map), 400)
   })
 
-  // Re-render fire layer after zoom so downsampling reflects new zoom level
-  map.on('zoomend', () => renderFireLayer())
+  // On zoom: update current zoom, re-downsample fire, sync aircraft visibility
+  map.on('zoomend', () => {
+    currentZoom.value = map.getZoom()
+    renderFireLayer()
+    syncAircraftVisibility(map)
+  })
 
-  // Emit initial bounds after tiles settle (~300ms)
+  // Emit initial bounds after tiles settle
   setTimeout(() => emitCurrentBounds(map), 300)
 
-  // Start RAF animation loop for smooth aircraft interpolation
   rafId = requestAnimationFrame(tickAircraft)
 })
 
@@ -202,27 +241,24 @@ onUnmounted(() => {
   if (rafId !== null) cancelAnimationFrame(rafId)
   for (const { marker } of aircraftRegistry.values()) marker.remove()
   aircraftRegistry.clear()
+  for (const { marker } of shipRegistry.values()) marker.remove()
+  shipRegistry.clear()
   mapInstance.value?.remove()
   mapInstance.value = null
 })
 
-// ── Tile swap on style change ──────────────────────────────────────────────────
+// ── Tile swap ──────────────────────────────────────────────────────────────────
 watch(() => props.mapStyle, (style) => {
-  const map = mapInstance.value
-  if (!map) return
+  const map = mapInstance.value; if (!map) return
   tileLayer.value?.remove()
-  const def = tileDefs[style]
-  tileLayer.value = L.tileLayer(def.url, def.options).addTo(map)
+  tileLayer.value = L.tileLayer(tileDefs[style].url, tileDefs[style].options).addTo(map)
 })
 
-// ── GeoJSON spatial query layer ────────────────────────────────────────────────
+// ── GeoJSON spatial query ──────────────────────────────────────────────────────
 watch(() => props.data, (fc) => {
-  const map = mapInstance.value
-  if (!map) return
-  geoLayer.value?.remove()
-  geoLayer.value = null
+  const map = mapInstance.value; if (!map) return
+  geoLayer.value?.remove(); geoLayer.value = null
   if (!fc || fc.features.length === 0) return
-
   const layer = L.geoJSON(fc as unknown as GeoJSON.FeatureCollection, {
     style: { color: '#3a8fd4', weight: 1.5, fillOpacity: 0.25, fillColor: '#3a8fd4' },
     pointToLayer: (_f, latlng) =>
@@ -231,8 +267,7 @@ watch(() => props.data, (fc) => {
       const p = feature.properties ?? {}
       const rows = Object.entries(p)
         .filter(([k]) => !k.startsWith('osm_'))
-        .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`)
-        .join('')
+        .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`).join('')
       if (rows) layer.bindPopup(`<table style="font-size:12px;border-collapse:collapse">${rows}</table>`)
     },
   }).addTo(map)
@@ -240,34 +275,26 @@ watch(() => props.data, (fc) => {
   try { map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] }) } catch {}
 })
 
-// ── FIRMS fire dots — zoom-adaptive, re-renders on data change ─────────────────
+// ── FIRMS fire dots ────────────────────────────────────────────────────────────
 watch(() => props.fireData, () => renderFireLayer())
 
-// ── Aircraft: canvas circleMarker registry with RAF interpolation ──────────────
+// ── Aircraft: ✈ DivIcon registry, zoom-gated, RAF-interpolated ────────────────
 watch(() => props.aircraftData, (states) => {
-  const map = mapInstance.value
-  if (!map) return
+  const map = mapInstance.value; if (!map) return
+  const showNow = currentZoom.value >= 4 && props.showAircraft
 
   const seen = new Set<string>()
   for (const s of states) {
     seen.add(s.icao24)
     const existing = aircraftRegistry.get(s.icao24)
     if (existing) {
-      // Reuse marker — update interpolation target from current position
       const cur = existing.marker.getLatLng()
-      existing.fromLat   = cur.lat
-      existing.fromLon   = cur.lng
-      existing.toLat     = s.lat
-      existing.toLon     = s.lon
+      existing.fromLat = cur.lat; existing.fromLon = cur.lng
+      existing.toLat   = s.lat;   existing.toLon   = s.lon
       existing.startTime = performance.now()
-      const airColor = s.on_ground ? '#6b7280' : '#60a5fa'
-      existing.marker.setStyle({ color: airColor, fillColor: airColor })
+      existing.marker.setIcon(makePlaneIcon(s.heading, s.on_ground))
     } else {
-      // New aircraft — create canvas circleMarker and add to map
-      const airColor = s.on_ground ? '#6b7280' : '#60a5fa'
-      const marker = L.circleMarker([s.lat, s.lon], {
-        radius: 4, color: airColor, fillColor: airColor, fillOpacity: 0.85, weight: 1,
-      })
+      const marker = L.marker([s.lat, s.lon], { icon: makePlaneIcon(s.heading, s.on_ground) })
       const callsign = s.callsign || s.icao24
       marker.bindPopup(
         `<div style="font-size:12px;min-width:160px">
@@ -280,21 +307,104 @@ watch(() => props.aircraftData, (states) => {
           <b>Status:</b> ${s.on_ground ? '🟡 On ground' : '🔵 Airborne'}
         </div>`,
         { maxWidth: 220 },
-      ).addTo(map)
+      )
+      if (showNow) marker.addTo(map)
       aircraftRegistry.set(s.icao24, {
         marker, fromLat: s.lat, fromLon: s.lon,
         toLat: s.lat, toLon: s.lon, startTime: performance.now(),
       })
     }
   }
-
-  // Remove aircraft that disappeared from the feed
+  // Remove aircraft no longer in feed
   for (const [id, entry] of aircraftRegistry) {
-    if (!seen.has(id)) {
-      entry.marker.remove()
-      aircraftRegistry.delete(id)
+    if (!seen.has(id)) { entry.marker.remove(); aircraftRegistry.delete(id) }
+  }
+})
+
+// ── Ships: canvas circleMarker registry ────────────────────────────────────────
+watch(() => props.shipData, (states) => {
+  const map = mapInstance.value; if (!map) return
+
+  const seen = new Set<number>()
+  for (const s of states) {
+    seen.add(s.mmsi)
+    const existing = shipRegistry.get(s.mmsi)
+    if (existing) {
+      const cur = existing.marker.getLatLng()
+      existing.fromLat = cur.lat; existing.fromLon = cur.lng
+      existing.toLat   = s.lat;   existing.toLon   = s.lon
+      existing.startTime = performance.now()
+    } else {
+      const marker = L.circleMarker([s.lat, s.lon], {
+        radius: 5, color: '#10b981', fillColor: '#10b981', fillOpacity: 0.85, weight: 1,
+      })
+      const name = s.name || String(s.mmsi)
+      marker.bindPopup(
+        `<div style="font-size:12px;min-width:160px">
+          <b style="font-size:13px">🚢 ${name}</b><br>
+          <span style="color:#888">MMSI: ${s.mmsi}</span>
+          <hr style="margin:4px 0;border-color:#333">
+          <b>Speed:</b> ${fmtKnots(s.speed)}<br>
+          <b>Heading:</b> ${Math.round(s.heading)}°
+        </div>`,
+        { maxWidth: 200 },
+      )
+      if (props.showShips) marker.addTo(map)
+      shipRegistry.set(s.mmsi, {
+        marker, fromLat: s.lat, fromLon: s.lon,
+        toLat: s.lat, toLon: s.lon, startTime: performance.now(),
+      })
     }
   }
+  for (const [id, entry] of shipRegistry) {
+    if (!seen.has(id)) { entry.marker.remove(); shipRegistry.delete(id) }
+  }
+})
+
+// ── CCTV cameras ───────────────────────────────────────────────────────────────
+watch(() => props.cameraData, (cameras) => {
+  const map = mapInstance.value; if (!map) return
+  cameraLayer.value?.remove(); cameraLayer.value = null
+  if (!cameras?.length) return
+  const group = L.layerGroup()
+  for (const c of cameras) {
+    L.circleMarker([c.lat, c.lon], {
+      radius: 6, color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 0.9, weight: 1.5,
+    })
+      .bindPopup(
+        `<div style="font-size:12px">
+          <b>📷 ${c.name}</b> <span style="color:#888">(${c.city})</span><br>
+          <img src="${c.snapshot_url}" style="width:280px;max-height:200px;object-fit:cover;border-radius:4px;margin-top:6px;display:block" loading="lazy" onerror="this.style.display='none'">
+        </div>`,
+        { maxWidth: 300 },
+      )
+      .addTo(group)
+  }
+  if (props.showCameras) group.addTo(map)
+  cameraLayer.value = group
+})
+
+// ── Layer visibility toggles ───────────────────────────────────────────────────
+watch(() => props.showAircraft, () => {
+  const map = mapInstance.value; if (!map) return
+  syncAircraftVisibility(map)
+})
+
+watch(() => props.showShips, (v) => {
+  const map = mapInstance.value; if (!map) return
+  for (const { marker } of shipRegistry.values()) {
+    v ? marker.addTo(map) : marker.remove()
+  }
+})
+
+watch(() => props.showCameras, (v) => {
+  const map = mapInstance.value; if (!map || !cameraLayer.value) return
+  v ? cameraLayer.value.addTo(map) : cameraLayer.value.remove()
+})
+
+watch(() => props.showFire, (v) => {
+  const map = mapInstance.value; if (!map || !fireLayer.value) return
+  v ? fireLayer.value.addTo(map) : fireLayer.value.remove()
 })
 </script>
 
@@ -306,61 +416,37 @@ watch(() => props.aircraftData, (states) => {
   background-color: #0e0e10;
   overflow: hidden;
 }
-
 .globe-wrap.style-light     { background-color: #f0ede8; }
 .globe-wrap.style-satellite { background-color: #1a1a1a; }
 
-.map-container {
-  width: 100%;
-  height: 100%;
-}
+.map-container { width: 100%; height: 100%; }
 
-.style-dark :deep(.leaflet-container)     { background: #0e0e10; }
-.style-light :deep(.leaflet-container)    { background: #f0ede8; }
-.style-satellite :deep(.leaflet-container){ background: #1a1a1a; }
-
-.style-light :deep(.leaflet-popup-content-wrapper) {
-  background: #fff;
-  color: #111;
-}
+.style-dark :deep(.leaflet-container)      { background: #0e0e10; }
+.style-light :deep(.leaflet-container)     { background: #f0ede8; }
+.style-satellite :deep(.leaflet-container) { background: #1a1a1a; }
+.style-light :deep(.leaflet-popup-content-wrapper) { background: #fff; color: #111; }
 
 .loading-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  background: rgba(13, 17, 23, 0.6);
-  z-index: 1001;
-  pointer-events: none;
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  background: rgba(13,17,23,0.6);
+  z-index: 1001; pointer-events: none;
 }
 
 @keyframes spin { to { transform: rotate(360deg); } }
-
 .spinner {
-  width: 22px;
-  height: 22px;
-  border: 3px solid #2a3a4a;
-  border-top-color: #3a8fd4;
-  border-radius: 50%;
-  animation: spin 0.7s linear infinite;
+  width: 22px; height: 22px;
+  border: 3px solid #2a3a4a; border-top-color: #3a8fd4;
+  border-radius: 50%; animation: spin 0.7s linear infinite;
 }
-
 .loading-text { font-size: 0.88rem; color: #8ab0c8; }
 
 .overlay {
-  position: absolute;
-  top: 12px;
-  left: 12px;
-  background: rgba(13, 17, 23, 0.88);
-  border: 1px solid #2a3040;
-  border-radius: 4px;
-  padding: 6px 12px;
-  pointer-events: none;
-  z-index: 1000;
+  position: absolute; top: 12px; left: 12px;
+  background: rgba(13,17,23,0.88); border: 1px solid #2a3040;
+  border-radius: 4px; padding: 6px 12px;
+  pointer-events: none; z-index: 1000;
 }
-
 .hint { color: #5a6a7a; font-size: 0.82rem; }
 .info { color: #3a8fd4; font-size: 0.82rem; font-weight: 600; }
 </style>

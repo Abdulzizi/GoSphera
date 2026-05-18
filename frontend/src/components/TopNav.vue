@@ -22,16 +22,49 @@
 
       <span class="stat-chip chip-blue">
         <span class="dot dot-blue" />
-        ✈ {{ aircraftCount.toLocaleString() }} aircraft
+        ✈ {{ aircraftCount.toLocaleString() }}
+      </span>
+
+      <span class="stat-chip chip-teal">
+        <span class="dot dot-teal" />
+        🚢 {{ shipCount.toLocaleString() }}
       </span>
 
       <span :class="['stat-chip', sseConnected ? 'chip-green' : 'chip-red']">
         <span :class="['dot', sseConnected ? 'dot-green dot-pulse' : 'dot-red']" />
-        SSE: {{ sseConnected ? 'connected' : 'disconnected' }}
+        SSE: {{ sseConnected ? 'live' : 'off' }}
       </span>
     </div>
 
     <div class="nav-right">
+      <!-- Layer toggles -->
+      <button
+        :class="['layer-btn', showAircraft ? 'layer-active-blue' : '']"
+        title="Toggle aircraft layer"
+        @click="emit('toggle-layer', 'aircraft')"
+      >✈ Air</button>
+
+      <button
+        :class="['layer-btn', showShips ? 'layer-active-teal' : '']"
+        title="Toggle ships layer"
+        @click="emit('toggle-layer', 'ships')"
+      >🚢 Sea</button>
+
+      <button
+        :class="['layer-btn', showCameras ? 'layer-active-amber' : '']"
+        title="Toggle cameras layer"
+        @click="emit('toggle-layer', 'cameras')"
+      >📷 Cam</button>
+
+      <button
+        :class="['layer-btn', showFire ? 'layer-active-orange' : '']"
+        title="Toggle fire layer"
+        @click="emit('toggle-layer', 'fire')"
+      >🔥 Fire</button>
+
+      <div class="sep" />
+
+      <!-- Map style toggle -->
       <button class="nav-btn" :title="`Switch map style (current: ${mapStyle})`" @click="cycleStyle">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="15" height="15">
           <path v-if="mapStyle === 'dark'" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
@@ -61,15 +94,21 @@
 import { computed } from 'vue'
 
 const props = defineProps<{
-  firmsCount: number
+  firmsCount:   number
   firmsFetched: number
   sseConnected: boolean
   aircraftCount: number
-  mapStyle: 'dark' | 'light' | 'satellite'
+  shipCount:    number
+  mapStyle:     'dark' | 'light' | 'satellite'
+  showAircraft: boolean
+  showShips:    boolean
+  showCameras:  boolean
+  showFire:     boolean
 }>()
 
 const emit = defineEmits<{
-  'style-change': [style: 'dark' | 'light' | 'satellite']
+  'style-change':  [style: 'dark' | 'light' | 'satellite']
+  'toggle-layer':  [layer: string]
 }>()
 
 const styles = ['dark', 'light', 'satellite'] as const
@@ -90,29 +129,31 @@ function cycleStyle() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
+  padding: 0 12px;
   background: #0d1117;
   border-bottom: 1px solid #1e2a35;
   height: 48px;
   flex-shrink: 0;
   z-index: 100;
+  gap: 8px;
 }
 
 .nav-left {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .nav-icon {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   color: #3a8fd4;
   flex-shrink: 0;
 }
 
 .nav-wordmark {
-  font-size: 1rem;
+  font-size: 0.95rem;
   font-weight: 700;
   color: #e0eaf4;
   letter-spacing: 0.04em;
@@ -121,35 +162,41 @@ function cycleStyle() {
 .nav-center {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex: 1;
+  justify-content: center;
+  overflow: hidden;
 }
 
 .stat-chip {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
+  gap: 5px;
+  padding: 3px 9px;
   background: #131920;
   border: 1px solid #1e2a35;
   border-radius: 20px;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   color: #8ab0c8;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.chip-blue    { border-color: #1a3a5a; }
-.chip-green   { border-color: #1a4a2a; }
-.chip-red     { border-color: #4a1a1a; }
+.chip-blue  { border-color: #1a3a5a; }
+.chip-teal  { border-color: #0d3a2a; }
+.chip-green { border-color: #1a4a2a; }
+.chip-red   { border-color: #4a1a1a; }
 
 .dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
 }
 
 .dot-orange { background: #f97316; }
 .dot-blue   { background: #3a8fd4; }
+.dot-teal   { background: #10b981; }
 .dot-green  { background: #22c55e; }
 .dot-red    { background: #ef4444; }
 
@@ -162,21 +209,52 @@ function cycleStyle() {
 .nav-right {
   display: flex;
   align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
+.sep {
+  width: 1px;
+  height: 20px;
+  background: #1e2a35;
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+
+/* Layer toggle buttons */
+.layer-btn {
+  padding: 4px 9px;
+  background: #131920;
+  border: 1px solid #1e2a35;
+  border-radius: 5px;
+  color: #5a6a7a;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+.layer-btn:hover { background: #1a2535; color: #8ab0c8; }
+
+.layer-active-blue   { border-color: #2a5a8a; color: #60a5fa; background: #0d1e30; }
+.layer-active-teal   { border-color: #0d5a3a; color: #10b981; background: #071e14; }
+.layer-active-amber  { border-color: #5a420d; color: #f59e0b; background: #1e1505; }
+.layer-active-orange { border-color: #5a2e0d; color: #f97316; background: #1e0e05; }
+
+/* Map style button */
 .nav-btn {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 12px;
+  gap: 5px;
+  padding: 4px 10px;
   background: #131920;
   border: 1px solid #1e2a35;
-  border-radius: 6px;
+  border-radius: 5px;
   color: #8ab0c8;
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-  min-width: 100px;
+  transition: background 0.12s, color 0.12s;
+  min-width: 80px;
+  white-space: nowrap;
 }
 .nav-btn:hover { background: #1a2535; color: #c0d8e8; }
 </style>
