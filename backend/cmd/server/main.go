@@ -187,45 +187,93 @@ func handleSpatialQuery(client *spatial.Client) http.HandlerFunc {
 	}
 }
 
-// handleSituational handles GET /api/situational?limit=N (default 500, max 5000).
-// Always sets X-Total-Count to the real cached record count before applying the limit.
+// bboxFilter holds parsed viewport bounds from query parameters.
+type bboxFilter struct {
+	minLat, minLon, maxLat, maxLon float64
+	active                         bool
+}
+
+// parseBboxFilter reads optional ?minLat=&minLon=&maxLat=&maxLon= query params.
+// Returns an inactive filter if any param is missing or unparseable.
+func parseBboxFilter(r *http.Request) bboxFilter {
+	q := r.URL.Query()
+	sMinLat, sMinLon := q.Get("minLat"), q.Get("minLon")
+	sMaxLat, sMaxLon := q.Get("maxLat"), q.Get("maxLon")
+	if sMinLat == "" || sMinLon == "" || sMaxLat == "" || sMaxLon == "" {
+		return bboxFilter{}
+	}
+	minLat, e1 := strconv.ParseFloat(sMinLat, 64)
+	minLon, e2 := strconv.ParseFloat(sMinLon, 64)
+	maxLat, e3 := strconv.ParseFloat(sMaxLat, 64)
+	maxLon, e4 := strconv.ParseFloat(sMaxLon, 64)
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+		return bboxFilter{}
+	}
+	return bboxFilter{minLat, minLon, maxLat, maxLon, true}
+}
+
+// handleSituational handles GET /api/situational with optional bbox filtering.
+// With bbox: returns all records within the viewport.
+// Without bbox: caps at 5000 records to protect mobile clients on initial load.
+// Always sets X-Total-Count to the full cached record count.
 func handleSituational(cache *aggregator.Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		records := cache.GetAll()
 		w.Header().Set("X-Total-Count", strconv.Itoa(len(records)))
 
-		limit := 0 // 0 = all
-		if s := r.URL.Query().Get("limit"); s != "" {
-			if n, err := strconv.Atoi(s); err == nil && n > 0 {
-				limit = n
+		bbox := parseBboxFilter(r)
+		if bbox.active {
+			filtered := records[:0:0]
+			for _, rec := range records {
+				if rec.Lat >= bbox.minLat && rec.Lat <= bbox.maxLat &&
+					rec.Lon >= bbox.minLon && rec.Lon <= bbox.maxLon {
+					filtered = append(filtered, rec)
+				}
+			}
+			records = filtered
+		} else {
+			// No viewport supplied: protect mobile from 203k records on first load
+			const defaultCap = 5000
+			if len(records) > defaultCap {
+				records = records[:defaultCap]
 			}
 		}
-		if limit > 0 && limit < len(records) {
-			records = records[:limit]
-		}
+
 		writeJSON(w, http.StatusOK, records)
 	}
 }
 
-// handleAircraft handles GET /api/aircraft?limit=N (default 1500, max 5000).
-// Returns live aircraft state vectors from the OpenSky cache.
+// handleAircraft handles GET /api/aircraft with optional bbox filtering.
+// With bbox: returns all aircraft within the viewport (no additional limit).
+// Without bbox: applies default limit of 1500, max 5000.
+// Always sets X-Total-Count to the full cached state count.
 func handleAircraft(cache *aircraft.Cache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		states := cache.GetAll()
 		w.Header().Set("X-Total-Count", strconv.Itoa(len(states)))
 
-		limit := 1500
-		if s := r.URL.Query().Get("limit"); s != "" {
-			if n, err := strconv.Atoi(s); err == nil && n > 0 {
-				limit = n
+		bbox := parseBboxFilter(r)
+		if bbox.active {
+			filtered := states[:0:0]
+			for _, s := range states {
+				if s.Lat >= bbox.minLat && s.Lat <= bbox.maxLat &&
+					s.Lon >= bbox.minLon && s.Lon <= bbox.maxLon {
+					filtered = append(filtered, s)
+				}
+			}
+			states = filtered
+		} else {
+			limit := 1500
+			if s := r.URL.Query().Get("limit"); s != "" {
+				if n, err := strconv.Atoi(s); err == nil && n > 0 && n <= 5000 {
+					limit = n
+				}
+			}
+			if limit < len(states) {
+				states = states[:limit]
 			}
 		}
-		if limit > 5000 {
-			limit = 5000
-		}
-		if limit < len(states) {
-			states = states[:limit]
-		}
+
 		writeJSON(w, http.StatusOK, states)
 	}
 }

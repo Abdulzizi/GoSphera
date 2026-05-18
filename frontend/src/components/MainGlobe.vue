@@ -18,7 +18,7 @@
 import { ref, shallowRef, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import type { FeatureCollection, FireRecord, AircraftState } from '../services/api'
+import type { FeatureCollection, FireRecord, AircraftState, BBox } from '../services/api'
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon   from 'leaflet/dist/images/marker-icon.png'
@@ -36,30 +36,56 @@ const props = defineProps<{
   mapStyle:     MapStyle
 }>()
 
+const emit = defineEmits<{
+  'bbox-change': [bbox: BBox]
+}>()
+
+// ── Refs ───────────────────────────────────────────────────────────────────────
 const mapEl       = ref<HTMLDivElement | null>(null)
 const mapInstance = shallowRef<L.Map | null>(null)
 const tileLayer   = shallowRef<L.TileLayer | null>(null)
 const geoLayer    = shallowRef<L.GeoJSON | null>(null)
 const fireLayer   = shallowRef<L.LayerGroup | null>(null)
-const aircraftLayer = shallowRef<L.LayerGroup | null>(null)
 
 const featureCount = computed(() => props.data?.features.length ?? 0)
 
+// ── Aircraft: canvas circleMarker registry + RAF smooth interpolation ──────────
+type AircraftEntry = {
+  marker:    L.CircleMarker
+  fromLat:   number
+  fromLon:   number
+  toLat:     number
+  toLon:     number
+  startTime: number
+}
+const aircraftRegistry = new Map<string, AircraftEntry>()
+let rafId: number | null = null
+const INTERP_MS = 14_000 // slightly less than 15s poll interval
+
+function tickAircraft(now: number) {
+  for (const entry of aircraftRegistry.values()) {
+    const t = Math.min(1, (now - entry.startTime) / INTERP_MS)
+    const lat = entry.fromLat + (entry.toLat - entry.fromLat) * t
+    const lon = entry.fromLon + (entry.toLon - entry.fromLon) * t
+    entry.marker.setLatLng([lat, lon])
+  }
+  rafId = requestAnimationFrame(tickAircraft)
+}
+
+// ── Tile definitions ───────────────────────────────────────────────────────────
 const tileDefs: Record<MapStyle, { url: string; options: L.TileLayerOptions }> = {
   dark: {
     url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
     options: {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
-      subdomains: 'abcd',
-      maxZoom: 19,
+      subdomains: 'abcd', maxZoom: 19,
     },
   },
   light: {
     url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
     options: {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
-      subdomains: 'abcd',
-      maxZoom: 19,
+      subdomains: 'abcd', maxZoom: 19,
     },
   },
   satellite: {
@@ -71,18 +97,6 @@ const tileDefs: Record<MapStyle, { url: string; options: L.TileLayerOptions }> =
   },
 }
 
-function makePlaneIcon(heading: number, onGround: boolean): L.DivIcon {
-  const color  = onGround ? '#6b7280' : '#60a5fa'
-  const shadow = onGround ? 'none'    : '0 0 4px rgba(96,165,250,0.6)'
-  return L.divIcon({
-    html: `<div style="transform:rotate(${heading}deg);color:${color};font-size:15px;line-height:1;text-shadow:${shadow};user-select:none">✈</div>`,
-    className: '',
-    iconSize:   [16, 16],
-    iconAnchor: [8, 8],
-    popupAnchor:[0, -12],
-  })
-}
-
 function fmtAlt(m: number): string {
   if (!m) return 'n/a'
   return `${Math.round(m).toLocaleString()} m (${Math.round(m * 3.28084).toLocaleString()} ft)`
@@ -92,6 +106,61 @@ function fmtSpeed(ms: number): string {
   return `${Math.round(ms)} m/s (${Math.round(ms * 1.944)} kts)`
 }
 
+// ── Zoom-adaptive FIRMS downsampling (no external library) ─────────────────────
+// At low zoom, merge nearby fire dots into a single representative point using a
+// spatial hash grid.  Grid cell size shrinks as zoom increases → full detail at z7+.
+function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
+  if (zoom >= 7) return records
+  // cellDeg: ~3.2° at z2 → ~0.1° at z6
+  const cellDeg = Math.pow(2, 7 - zoom) * 0.05
+  const grid = new Map<string, FireRecord>()
+  for (const r of records) {
+    const key = `${Math.floor(r.latitude / cellDeg)},${Math.floor(r.longitude / cellDeg)}`
+    if (!grid.has(key)) grid.set(key, r)
+  }
+  return Array.from(grid.values())
+}
+
+// Extracted fire render — called on data change AND on zoomend
+function renderFireLayer() {
+  const map = mapInstance.value
+  if (!map) return
+  fireLayer.value?.remove()
+  fireLayer.value = null
+  if (!props.fireData?.length) return
+
+  const zoom = map.getZoom()
+  const sampled = downsampleFire(props.fireData, zoom)
+
+  const group = L.layerGroup()
+  for (const r of sampled) {
+    L.circleMarker([r.latitude, r.longitude], {
+      radius: 4, color: '#f97316', fillColor: '#f97316', fillOpacity: 0.7, weight: 0.5,
+    })
+      .bindPopup(
+        `<b>Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>` +
+        `Confidence: ${r.confidence}<br>Date: ${r.acq_date}`,
+      )
+      .addTo(group)
+  }
+  group.addTo(map)
+  fireLayer.value = group
+}
+
+// ── Viewport bbox emit ─────────────────────────────────────────────────────────
+let moveDebounce: ReturnType<typeof setTimeout> | null = null
+
+function emitCurrentBounds(map: L.Map) {
+  const b = map.getBounds()
+  emit('bbox-change', {
+    minLat: b.getSouth(),
+    minLon: b.getWest(),
+    maxLat: b.getNorth(),
+    maxLon: b.getEast(),
+  })
+}
+
+// ── Lifecycle ──────────────────────────────────────────────────────────────────
 onMounted(async () => {
   await nextTick()
   if (!mapEl.value) return
@@ -108,111 +177,125 @@ onMounted(async () => {
 
   const def = tileDefs[props.mapStyle]
   tileLayer.value = L.tileLayer(def.url, def.options).addTo(map)
-
   L.control.zoom({ position: 'bottomright' }).addTo(map)
   map.invalidateSize(true)
   mapInstance.value = map
+
+  // Emit viewport bbox after pan/zoom — debounced to avoid rapid-fire fetches
+  map.on('moveend', () => {
+    if (moveDebounce) clearTimeout(moveDebounce)
+    moveDebounce = setTimeout(() => emitCurrentBounds(map), 400)
+  })
+
+  // Re-render fire layer after zoom so downsampling reflects new zoom level
+  map.on('zoomend', () => renderFireLayer())
+
+  // Emit initial bounds after tiles settle (~300ms)
+  setTimeout(() => emitCurrentBounds(map), 300)
+
+  // Start RAF animation loop for smooth aircraft interpolation
+  rafId = requestAnimationFrame(tickAircraft)
 })
 
 onUnmounted(() => {
+  if (moveDebounce) clearTimeout(moveDebounce)
+  if (rafId !== null) cancelAnimationFrame(rafId)
+  for (const { marker } of aircraftRegistry.values()) marker.remove()
+  aircraftRegistry.clear()
   mapInstance.value?.remove()
   mapInstance.value = null
 })
 
-// Swap tile layer when map style changes
-watch(
-  () => props.mapStyle,
-  (style) => {
-    const map = mapInstance.value
-    if (!map) return
-    tileLayer.value?.remove()
-    const def = tileDefs[style]
-    tileLayer.value = L.tileLayer(def.url, def.options).addTo(map)
-  },
-)
+// ── Tile swap on style change ──────────────────────────────────────────────────
+watch(() => props.mapStyle, (style) => {
+  const map = mapInstance.value
+  if (!map) return
+  tileLayer.value?.remove()
+  const def = tileDefs[style]
+  tileLayer.value = L.tileLayer(def.url, def.options).addTo(map)
+})
 
-// GeoJSON spatial query layer
-watch(
-  () => props.data,
-  (fc) => {
-    const map = mapInstance.value
-    if (!map) return
-    geoLayer.value?.remove()
-    geoLayer.value = null
-    if (!fc || fc.features.length === 0) return
+// ── GeoJSON spatial query layer ────────────────────────────────────────────────
+watch(() => props.data, (fc) => {
+  const map = mapInstance.value
+  if (!map) return
+  geoLayer.value?.remove()
+  geoLayer.value = null
+  if (!fc || fc.features.length === 0) return
 
-    const layer = L.geoJSON(fc as unknown as GeoJSON.FeatureCollection, {
-      style: { color: '#3a8fd4', weight: 1.5, fillOpacity: 0.25, fillColor: '#3a8fd4' },
-      pointToLayer: (_f, latlng) =>
-        L.circleMarker(latlng, { radius: 6, color: '#3a8fd4', fillColor: '#3a8fd4', fillOpacity: 0.85, weight: 1 }),
-      onEachFeature: (feature, layer) => {
-        const p = feature.properties ?? {}
-        const rows = Object.entries(p)
-          .filter(([k]) => !k.startsWith('osm_'))
-          .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`)
-          .join('')
-        if (rows) layer.bindPopup(`<table style="font-size:12px;border-collapse:collapse">${rows}</table>`)
-      },
-    }).addTo(map)
-    geoLayer.value = layer
-    try { map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] }) } catch {}
-  },
-)
+  const layer = L.geoJSON(fc as unknown as GeoJSON.FeatureCollection, {
+    style: { color: '#3a8fd4', weight: 1.5, fillOpacity: 0.25, fillColor: '#3a8fd4' },
+    pointToLayer: (_f, latlng) =>
+      L.circleMarker(latlng, { radius: 6, color: '#3a8fd4', fillColor: '#3a8fd4', fillOpacity: 0.85, weight: 1 }),
+    onEachFeature: (feature, layer) => {
+      const p = feature.properties ?? {}
+      const rows = Object.entries(p)
+        .filter(([k]) => !k.startsWith('osm_'))
+        .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`)
+        .join('')
+      if (rows) layer.bindPopup(`<table style="font-size:12px;border-collapse:collapse">${rows}</table>`)
+    },
+  }).addTo(map)
+  geoLayer.value = layer
+  try { map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] }) } catch {}
+})
 
-// FIRMS fire dots layer
-watch(
-  () => props.fireData,
-  (records) => {
-    const map = mapInstance.value
-    if (!map) return
-    fireLayer.value?.remove()
-    fireLayer.value = null
-    if (!records?.length) return
+// ── FIRMS fire dots — zoom-adaptive, re-renders on data change ─────────────────
+watch(() => props.fireData, () => renderFireLayer())
 
-    const group = L.layerGroup()
-    for (const r of records) {
-      L.circleMarker([r.latitude, r.longitude], {
-        radius: 4, color: '#f97316', fillColor: '#f97316', fillOpacity: 0.7, weight: 0.5,
+// ── Aircraft: canvas circleMarker registry with RAF interpolation ──────────────
+watch(() => props.aircraftData, (states) => {
+  const map = mapInstance.value
+  if (!map) return
+
+  const seen = new Set<string>()
+  for (const s of states) {
+    seen.add(s.icao24)
+    const existing = aircraftRegistry.get(s.icao24)
+    if (existing) {
+      // Reuse marker — update interpolation target from current position
+      const cur = existing.marker.getLatLng()
+      existing.fromLat   = cur.lat
+      existing.fromLon   = cur.lng
+      existing.toLat     = s.lat
+      existing.toLon     = s.lon
+      existing.startTime = performance.now()
+      const airColor = s.on_ground ? '#6b7280' : '#60a5fa'
+      existing.marker.setStyle({ color: airColor, fillColor: airColor })
+    } else {
+      // New aircraft — create canvas circleMarker and add to map
+      const airColor = s.on_ground ? '#6b7280' : '#60a5fa'
+      const marker = L.circleMarker([s.lat, s.lon], {
+        radius: 4, color: airColor, fillColor: airColor, fillOpacity: 0.85, weight: 1,
       })
-        .bindPopup(`<b>Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>Confidence: ${r.confidence}<br>Date: ${r.acq_date}`)
-        .addTo(group)
-    }
-    group.addTo(map)
-    fireLayer.value = group
-  },
-)
-
-// Live aircraft layer
-watch(
-  () => props.aircraftData,
-  (states) => {
-    const map = mapInstance.value
-    if (!map) return
-    aircraftLayer.value?.remove()
-    aircraftLayer.value = null
-    if (!states?.length) return
-
-    const group = L.layerGroup()
-    for (const s of states) {
       const callsign = s.callsign || s.icao24
-      L.marker([s.lat, s.lon], { icon: makePlaneIcon(s.heading, s.on_ground) })
-        .bindPopup(
-          `<div style="font-size:12px;min-width:160px">
-            <b style="font-size:13px">${callsign}</b><br>
-            <span style="color:#888">${s.icao24} · ${s.country}</span><hr style="margin:4px 0;border-color:#333">
-            <b>Alt:</b> ${fmtAlt(s.altitude)}<br>
-            <b>Speed:</b> ${fmtSpeed(s.velocity)}<br>
-            <b>Heading:</b> ${Math.round(s.heading)}°<br>
-            <b>Status:</b> ${s.on_ground ? '🟡 On ground' : '🔵 Airborne'}
-          </div>`,
-          { maxWidth: 220 },
-        )
-        .addTo(group)
+      marker.bindPopup(
+        `<div style="font-size:12px;min-width:160px">
+          <b style="font-size:13px">${callsign}</b><br>
+          <span style="color:#888">${s.icao24} · ${s.country}</span>
+          <hr style="margin:4px 0;border-color:#333">
+          <b>Alt:</b> ${fmtAlt(s.altitude)}<br>
+          <b>Speed:</b> ${fmtSpeed(s.velocity)}<br>
+          <b>Heading:</b> ${Math.round(s.heading)}°<br>
+          <b>Status:</b> ${s.on_ground ? '🟡 On ground' : '🔵 Airborne'}
+        </div>`,
+        { maxWidth: 220 },
+      ).addTo(map)
+      aircraftRegistry.set(s.icao24, {
+        marker, fromLat: s.lat, fromLon: s.lon,
+        toLat: s.lat, toLon: s.lon, startTime: performance.now(),
+      })
     }
-    group.addTo(map)
-    aircraftLayer.value = group
-  },
-)
+  }
+
+  // Remove aircraft that disappeared from the feed
+  for (const [id, entry] of aircraftRegistry) {
+    if (!seen.has(id)) {
+      entry.marker.remove()
+      aircraftRegistry.delete(id)
+    }
+  }
+})
 </script>
 
 <style scoped>
@@ -224,7 +307,6 @@ watch(
   overflow: hidden;
 }
 
-/* Background color matches each tile style to avoid white flashes */
 .globe-wrap.style-light     { background-color: #f0ede8; }
 .globe-wrap.style-satellite { background-color: #1a1a1a; }
 
@@ -233,12 +315,10 @@ watch(
   height: 100%;
 }
 
-/* CartoDB dark background */
 .style-dark :deep(.leaflet-container)     { background: #0e0e10; }
 .style-light :deep(.leaflet-container)    { background: #f0ede8; }
 .style-satellite :deep(.leaflet-container){ background: #1a1a1a; }
 
-/* Light-mode popup text */
 .style-light :deep(.leaflet-popup-content-wrapper) {
   background: #fff;
   color: #111;

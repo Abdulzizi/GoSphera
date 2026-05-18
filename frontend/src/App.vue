@@ -19,6 +19,7 @@
         :aircraft-data="aircraftData"
         :is-loading="isLoading"
         :map-style="mapStyle"
+        @bbox-change="onBboxChange"
       />
       <RightPanel
         :fire-records="firmsData"
@@ -41,6 +42,7 @@ import {
   getSituationalData,
   getAircraftData,
   openEventStream,
+  type BBox,
   type FeatureCollection,
   type FireRecord,
   type TelemetryEvent,
@@ -54,21 +56,22 @@ interface QueryParams {
 
 const MAX_EVENTS = 200
 
-const geoData        = ref<FeatureCollection | null>(null)
-const firmsData      = ref<FireRecord[]>([])
-const firmsTotal     = ref(0)
-const liveEvents     = ref<TelemetryEvent[]>([])
-const aircraftData   = ref<AircraftState[]>([])
-const sseConnected   = ref(false)
-const isLoading      = ref(false)
-const mapStyle       = ref<'dark' | 'light' | 'satellite'>('dark')
+const geoData       = ref<FeatureCollection | null>(null)
+const firmsData     = ref<FireRecord[]>([])
+const firmsTotal    = ref(0)
+const liveEvents    = ref<TelemetryEvent[]>([])
+const aircraftData  = ref<AircraftState[]>([])
+const sseConnected  = ref(false)
+const isLoading     = ref(false)
+const mapStyle      = ref<'dark' | 'light' | 'satellite'>('dark')
+const mapBbox       = ref<BBox | null>(null)
 
-let closeStream: (() => void) | null = null
+let closeStream:   (() => void) | null = null
 let aircraftTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadSituational() {
   try {
-    const { records, total } = await getSituationalData()
+    const { records, total } = await getSituationalData(mapBbox.value ?? undefined)
     firmsData.value = records
     firmsTotal.value = total
   } catch (err) {
@@ -78,10 +81,18 @@ async function loadSituational() {
 
 async function loadAircraft() {
   try {
-    aircraftData.value = await getAircraftData()
+    aircraftData.value = await getAircraftData(mapBbox.value ?? undefined)
   } catch (err) {
     console.error('[App] failed to load aircraft data:', err)
   }
+}
+
+/** Called by MainGlobe on moveend (debounced 400ms) and once on initial load. */
+function onBboxChange(bbox: BBox) {
+  mapBbox.value = bbox
+  // Reload both layers with the new viewport bbox
+  loadAircraft()
+  loadSituational()
 }
 
 function onTelemetryEvent(event: TelemetryEvent) {
@@ -92,9 +103,12 @@ function onTelemetryEvent(event: TelemetryEvent) {
 }
 
 onMounted(() => {
+  // Initial loads run without bbox (bbox=null → backend caps at 5000)
+  // The map emits bbox ~300ms after mount, triggering a filtered reload
   loadSituational()
   loadAircraft()
-  // Poll aircraft every 15 s (respects OpenSky anonymous rate limit)
+
+  // Continue polling every 15s for new data within the current viewport
   aircraftTimer = setInterval(loadAircraft, 15_000)
 
   closeStream = openEventStream(

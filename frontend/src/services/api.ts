@@ -45,6 +45,25 @@ export interface TelemetryEvent {
 
 const API_BASE = '/api'
 
+/** Viewport bounding box — passed as query params to spatially filter backend responses. */
+export interface BBox {
+  minLat: number
+  minLon: number
+  maxLat: number
+  maxLon: number
+}
+
+function bboxParams(bbox?: BBox): string {
+  if (!bbox) return ''
+  const p = new URLSearchParams({
+    minLat: String(bbox.minLat),
+    minLon: String(bbox.minLon),
+    maxLat: String(bbox.maxLat),
+    maxLon: String(bbox.maxLon),
+  })
+  return '?' + p.toString()
+}
+
 async function apiFetch<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const res = await fetch(input, init)
   if (!res.ok) {
@@ -59,8 +78,8 @@ export function getSpatialData(tags: string, bbox: string): Promise<FeatureColle
   return apiFetch<FeatureCollection>(`${API_BASE}/spatial?${params}`)
 }
 
-export async function getSituationalData(): Promise<{ records: FireRecord[]; total: number }> {
-  const res = await fetch(`${API_BASE}/situational`) // no limit param → backend returns all
+export async function getSituationalData(bbox?: BBox): Promise<{ records: FireRecord[]; total: number }> {
+  const res = await fetch(`${API_BASE}/situational${bboxParams(bbox)}`)
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`API error ${res.status}: ${text}`)
@@ -70,8 +89,8 @@ export async function getSituationalData(): Promise<{ records: FireRecord[]; tot
   return { records, total }
 }
 
-export function getAircraftData(): Promise<AircraftState[]> {
-  return apiFetch<AircraftState[]>(`${API_BASE}/aircraft`)
+export function getAircraftData(bbox?: BBox): Promise<AircraftState[]> {
+  return apiFetch<AircraftState[]>(`${API_BASE}/aircraft${bboxParams(bbox)}`)
 }
 
 export function postTelemetry(event: TelemetryEvent): Promise<void> {
