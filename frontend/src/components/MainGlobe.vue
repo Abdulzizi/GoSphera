@@ -1,20 +1,25 @@
 <template>
   <div class="globe-wrap">
     <div ref="mapEl" class="map-container" />
+
+    <div v-if="isLoading" class="loading-overlay">
+      <span class="spinner" />
+      <span class="loading-text">Querying…</span>
+    </div>
+
     <div class="overlay">
-      <span v-if="!data" class="hint">Select tags &amp; bbox, then click Query</span>
-      <span v-else class="info">{{ featureCount }} features loaded</span>
+      <span v-if="!data && !isLoading" class="hint">Select tags &amp; bbox, then click Query</span>
+      <span v-else-if="data" class="info">{{ featureCount }} features loaded</span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, shallowRef, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, shallowRef, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import type { FeatureCollection } from '../services/api'
+import type { FeatureCollection, FireRecord } from '../services/api'
 
-// Fix Leaflet's default icon paths broken by Vite's asset pipeline.
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
 import markerIcon from 'leaflet/dist/images/marker-icon.png'
 import markerShadow from 'leaflet/dist/images/marker-shadow.png'
@@ -25,32 +30,39 @@ L.Icon.Default.mergeOptions({
   shadowUrl: markerShadow,
 })
 
-const props = defineProps<{ data: FeatureCollection | null }>()
+const props = defineProps<{
+  data: FeatureCollection | null
+  fireData: FireRecord[]
+  isLoading: boolean
+}>()
 
 const mapEl = ref<HTMLDivElement | null>(null)
-
-// shallowRef prevents Vue deep-proxying Leaflet internals —
-// keeps all rendering off the reactivity graph.
 const mapInstance = shallowRef<L.Map | null>(null)
 const geoLayer = shallowRef<L.GeoJSON | null>(null)
+const fireLayer = shallowRef<L.LayerGroup | null>(null)
 
 const featureCount = computed(() => props.data?.features.length ?? 0)
 
-onMounted(() => {
+onMounted(async () => {
+  await nextTick()
   if (!mapEl.value) return
 
   const map = L.map(mapEl.value, {
     center: [20, 0],
     zoom: 2,
-    preferCanvas: true, // faster for large point datasets
-    zoomControl: true,
+    preferCanvas: true,
+    zoomControl: false,
   })
 
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+    subdomains: 'abcd',
     maxZoom: 19,
   }).addTo(map)
 
+  L.control.zoom({ position: 'bottomright' }).addTo(map)
+
+  map.invalidateSize(true)
   mapInstance.value = map
 })
 
@@ -65,11 +77,8 @@ watch(
     const map = mapInstance.value
     if (!map) return
 
-    // Remove previous layer.
-    if (geoLayer.value) {
-      geoLayer.value.remove()
-      geoLayer.value = null
-    }
+    geoLayer.value?.remove()
+    geoLayer.value = null
 
     if (!fc || fc.features.length === 0) return
 
@@ -82,15 +91,15 @@ watch(
       },
       pointToLayer: (_feature, latlng) =>
         L.circleMarker(latlng, {
-          radius: 5,
+          radius: 6,
           color: '#3a8fd4',
           fillColor: '#3a8fd4',
           fillOpacity: 0.85,
           weight: 1,
         }),
       onEachFeature: (feature, layer) => {
-        const props = feature.properties ?? {}
-        const rows = Object.entries(props)
+        const p = feature.properties ?? {}
+        const rows = Object.entries(p)
           .filter(([k]) => !k.startsWith('osm_'))
           .map(([k, v]) => `<tr><td><b>${k}</b></td><td>${v}</td></tr>`)
           .join('')
@@ -105,8 +114,38 @@ watch(
     try {
       map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] })
     } catch {
-      // getBounds() throws if layer has no valid bounds (e.g. empty)
+      // empty bounds — safe to ignore
     }
+  },
+)
+
+watch(
+  () => props.fireData,
+  (records) => {
+    const map = mapInstance.value
+    if (!map) return
+
+    fireLayer.value?.remove()
+    fireLayer.value = null
+
+    if (!records || records.length === 0) return
+
+    const group = L.layerGroup()
+    for (const r of records) {
+      L.circleMarker([r.latitude, r.longitude], {
+        radius: 4,
+        color: '#f97316',
+        fillColor: '#f97316',
+        fillOpacity: 0.7,
+        weight: 0.5,
+      })
+        .bindPopup(
+          `<b>Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>Confidence: ${r.confidence}<br>Date: ${r.acq_date}`,
+        )
+        .addTo(group)
+    }
+    group.addTo(map)
+    fireLayer.value = group
   },
 )
 </script>
@@ -115,6 +154,7 @@ watch(
 .globe-wrap {
   position: relative;
   height: 100%;
+  min-height: 0;
   background-color: #0d1117;
   overflow: hidden;
 }
@@ -124,15 +164,40 @@ watch(
   height: 100%;
 }
 
-/* Dark tile layer tint via CSS filter */
-.map-container :deep(.leaflet-tile) {
-  filter: brightness(0.75) invert(1) hue-rotate(180deg);
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(13, 17, 23, 0.6);
+  z-index: 1001;
+  pointer-events: none;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 3px solid #2a3a4a;
+  border-top-color: #3a8fd4;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.loading-text {
+  font-size: 0.88rem;
+  color: #8ab0c8;
 }
 
 .overlay {
   position: absolute;
   top: 12px;
-  left: 50px; /* clear Leaflet zoom controls */
+  left: 12px;
   background: rgba(13, 17, 23, 0.88);
   border: 1px solid #2a3040;
   border-radius: 4px;
