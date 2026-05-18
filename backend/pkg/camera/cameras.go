@@ -61,6 +61,22 @@ var hlsCameras = []Camera{
 		StreamURL:   "https://nasatv-lh.akamaihd.net/i/NASA_101@319270/index_1000_av-p.m3u8",
 		StreamType:  "hls",
 	},
+	// Colorado DOT (COtrip) — live 24/7 highway stream on Streamlock CDN.
+	{
+		ID: "us-co-sfork", Name: "CO Hwy – S Fork W", City: "South Fork, Colorado",
+		Lat: 37.672, Lon: -106.636,
+		SnapshotURL: "",
+		StreamURL:   "https://5b106cf3460bf.streamlock.net:443/cotrip/160_S_Fork_W.stream/playlist.m3u8",
+		StreamType:  "hls",
+	},
+	// Florida DOT District 5 ATMS — live intersection CCTV.
+	{
+		ID: "us-fl-c81109", Name: "FDOT D5 – C81109", City: "Orlando, Florida",
+		Lat: 28.538, Lon: -81.379,
+		SnapshotURL: "",
+		StreamURL:   "https://atms.dot.state.fl.us/D5/CCTV/C81109/C81109.m3u8",
+		StreamType:  "hls",
+	},
 }
 
 // ── Camera registry ────────────────────────────────────────────────────────────

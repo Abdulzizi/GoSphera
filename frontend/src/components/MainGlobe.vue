@@ -59,7 +59,7 @@
           <div class="cam-fs-footer">
             <span v-if="fullscreenCam.streamType === 'hls'">HLS live stream</span>
             <span v-else-if="fullscreenCam.streamType === 'mjpeg'">MJPEG live feed</span>
-            <span v-else>Snapshot · auto-refreshes every 5 s</span>
+            <span v-else>Snapshot · ~1 s pre-fetch refresh</span>
             &nbsp;·&nbsp;{{ fullscreenCam.city }}
           </div>
         </div>
@@ -123,8 +123,9 @@ const fullscreenCam = ref<FsCam | null>(null)
 const fullscreenSrc = ref('')
 const camVideoEl   = ref<HTMLVideoElement | null>(null)
 const camMjpegEl   = ref<HTMLImageElement | null>(null)
-let fullscreenTimer: ReturnType<typeof setInterval> | null = null
-let hlsInstance:    Hls | null = null
+let fullscreenTimer:  ReturnType<typeof setInterval> | null = null
+let hlsInstance:     Hls | null = null
+let snapPreloader:   HTMLImageElement | null = null  // off-screen pre-fetch buffer
 
 function openCamFs(cam: FsCam) {
   // Tear down any previous session first
@@ -166,17 +167,38 @@ function openCamFs(cam: FsCam) {
     // MJPEG: browser streams via <img> natively — src set via template binding
     // Nothing extra needed here; teardown sets src='' to close the connection
   } else {
-    // Snapshot: poll every 5 s
-    fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
-    fullscreenTimer = setInterval(() => {
-      fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
-    }, 5_000)
+    // Snapshot: pre-fetch the next frame in a hidden Image() staging buffer.
+    // Only swap fullscreenSrc inside onload — the browser always shows a
+    // fully-decoded frame, so the visible image never flashes white.
+    // If the 1 s interval fires before the previous download completes, we
+    // overwrite snapPreloader.src; the earlier onload is discarded because the
+    // preloader object is the same instance — no stacking, no memory leak.
+    snapPreloader = new Image()
+
+    const fetchNextFrame = () => {
+      if (!snapPreloader) return
+      const next = `${cam.url}?t=${Date.now()}`
+      snapPreloader.onload  = () => { if (snapPreloader) fullscreenSrc.value = snapPreloader.src }
+      snapPreloader.onerror = () => {} // silently ignore 404 / 502 / timeout
+      snapPreloader.src = next
+    }
+
+    fetchNextFrame()                                      // immediate first frame
+    fullscreenTimer = setInterval(fetchNextFrame, 1_000)  // ~1 s cadence thereafter
   }
 }
 
 /** Destroy all active stream resources without clearing fullscreenCam. */
 function _teardownFs() {
   if (fullscreenTimer !== null) { clearInterval(fullscreenTimer); fullscreenTimer = null }
+  // Release the snapshot preloader: null out handlers before clearing src so
+  // any pending onload callback can never fire after teardown.
+  if (snapPreloader) {
+    snapPreloader.onload  = null
+    snapPreloader.onerror = null
+    snapPreloader.src     = ''
+    snapPreloader = null
+  }
   if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null }
   const video = camVideoEl.value
   if (video) { video.pause(); video.removeAttribute('src'); video.load() }
