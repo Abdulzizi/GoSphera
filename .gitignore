@@ -12,5 +12,6 @@ frontend/.env.local
 # Backend / Go
 backend/bin/
 backend/server
+backend/.env
 *.exe
 *.test

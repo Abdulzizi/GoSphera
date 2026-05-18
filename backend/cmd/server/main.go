@@ -21,10 +21,16 @@ import (
 	"github.com/abdulzizi/gosphera/pkg/telemetry"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/joho/godotenv"
 	"github.com/rs/cors"
 )
 
 func main() {
+	// Load .env if present (silently ignored when not found)
+	if err := godotenv.Load(); err == nil {
+		log.Println("[server] loaded .env file")
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
