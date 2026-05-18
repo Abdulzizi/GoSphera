@@ -73,7 +73,8 @@ const mapEl         = ref<HTMLDivElement | null>(null)
 const mapInstance   = shallowRef<L.Map | null>(null)
 const tileLayer     = shallowRef<L.TileLayer | null>(null)
 const geoLayer      = shallowRef<L.GeoJSON | null>(null)
-const fireLayer     = shallowRef<L.LayerGroup | null>(null)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const fireCluster   = shallowRef<any>(null)   // L.MarkerClusterGroup
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const shipCluster   = shallowRef<any>(null)   // L.MarkerClusterGroup
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -192,10 +193,19 @@ function fmtAlt(m: number)   { return m ? `${Math.round(m).toLocaleString()} m (
 function fmtSpeed(ms: number){ return ms ? `${Math.round(ms)} m/s (${Math.round(ms*1.944)} kts)` : 'n/a' }
 function fmtKnots(k: number) { return k ? `${k.toFixed(1)} kts` : 'n/a' }
 
-// ── Zoom-adaptive FIRMS downsampling ──────────────────────────────────────────
+// ── Fire: dot icon for use inside markerClusterGroup ─────────────────────────
+const fireDotIcon = L.divIcon({
+  html: `<div style="width:7px;height:7px;border-radius:50%;background:#f97316;box-shadow:0 0 4px rgba(249,115,22,0.8)"></div>`,
+  className: '',
+  iconSize: [7, 7], iconAnchor: [3, 3], popupAnchor: [0, -6],
+})
+
+// Spatial-hash downsampling keeps one point per cell — prevents dumping
+// 5000 markers into the cluster at global zoom (cluster would just show [5000]
+// everywhere). At z<6 we thin first so regional clusters show meaningful counts.
 function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
-  if (zoom >= 7) return records
-  const cellDeg = Math.pow(2, 7 - zoom) * 0.05
+  if (zoom >= 6) return records
+  const cellDeg = Math.pow(2, 6 - zoom) * 0.1   // ~3.2° at z2, ~0.4° at z5
   const grid = new Map<string, FireRecord>()
   for (const r of records) {
     const key = `${Math.floor(r.latitude / cellDeg)},${Math.floor(r.longitude / cellDeg)}`
@@ -205,19 +215,15 @@ function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
 }
 
 function renderFireLayer() {
-  const map = mapInstance.value; if (!map) return
-  fireLayer.value?.remove(); fireLayer.value = null
+  const cluster = fireCluster.value; if (!cluster) return
+  cluster.clearLayers()
   if (!props.fireData?.length) return
   const sampled = downsampleFire(props.fireData, currentZoom.value)
-  const group = L.layerGroup()
   for (const r of sampled) {
-    L.circleMarker([r.latitude, r.longitude], {
-      radius: 4, color: '#f97316', fillColor: '#f97316', fillOpacity: 0.7, weight: 0.5,
-    }).bindPopup(`<b>🔥 Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>Confidence: ${r.confidence}<br>Date: ${r.acq_date}`)
-      .addTo(group)
+    L.marker([r.latitude, r.longitude], { icon: fireDotIcon })
+      .bindPopup(`<b>🔥 Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>Confidence: ${r.confidence}<br>Date: ${r.acq_date}`)
+      .addTo(cluster)
   }
-  if (props.showFire) group.addTo(map)
-  fireLayer.value = group
 }
 
 // ── Viewport bbox emit ─────────────────────────────────────────────────────────
@@ -283,6 +289,19 @@ onMounted(async () => {
   if (props.showCameras) cClu.addTo(map)
   cameraCluster.value = cClu
 
+  // Fire cluster group — orange [N] cluster icons; individual dots at zoom ≥ 8
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fClu = (L as any).markerClusterGroup({
+    maxClusterRadius: 50,
+    disableClusteringAtZoom: 8,
+    spiderfyOnMaxZoom: false,
+    showCoverageOnHover: false,
+    iconCreateFunction: (cluster: { getChildCount(): number }) =>
+      makeCountCluster(cluster.getChildCount(), '#f97316'),
+  })
+  if (props.showFire) fClu.addTo(map)
+  fireCluster.value = fClu
+
   map.on('moveend', () => {
     if (moveDebounce) clearTimeout(moveDebounce)
     moveDebounce = setTimeout(() => emitCurrentBounds(map), 400)
@@ -308,6 +327,7 @@ onUnmounted(() => {
   shipRegistry.clear()
   shipCluster.value?.clearLayers()
   cameraCluster.value?.clearLayers()
+  fireCluster.value?.clearLayers()
   mapInstance.value?.remove()
   mapInstance.value = null
 })
@@ -477,8 +497,8 @@ watch(() => props.showCameras, (v) => {
   v ? cameraCluster.value.addTo(map) : cameraCluster.value.remove()
 })
 watch(() => props.showFire, (v) => {
-  const map = mapInstance.value; if (!map || !fireLayer.value) return
-  v ? fireLayer.value.addTo(map) : fireLayer.value.remove()
+  const map = mapInstance.value; if (!map || !fireCluster.value) return
+  v ? fireCluster.value.addTo(map) : fireCluster.value.remove()
 })
 </script>
 
