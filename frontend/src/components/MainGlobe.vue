@@ -132,19 +132,33 @@ function openCamFs(cam: FsCam) {
   fullscreenCam.value = cam
 
   if (cam.streamType === 'hls') {
-    // HLS: attach after next tick so <video> is in the DOM
+    // HLS: always route through the Go relay proxy — it fetches the source .m3u8,
+    // rewrites all segment URLs to /api/stream/{id}/seg, and adds CORS headers.
+    // This makes ANY HLS source play in the browser regardless of the source's CORS policy.
     nextTick(() => {
       const video = camVideoEl.value
       if (!video) return
-      const src = cam.streamUrl || cam.url
+      const proxySrc = `/api/stream/${cam.id}/playlist.m3u8`
       if (Hls.isSupported()) {
-        hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: false })
-        hlsInstance.loadSource(src)
+        hlsInstance = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          debug: false,
+          manifestLoadingMaxRetry: 4,
+          levelLoadingMaxRetry: 4,
+          fragLoadingMaxRetry: 6,
+        })
+        hlsInstance.loadSource(proxySrc)
         hlsInstance.attachMedia(video)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}) })
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        hlsInstance.on(Hls.Events.ERROR, (_e: any, data: any) => {
+          if (data.fatal) console.warn('[HLS] fatal error — stream may be offline:', data.type, data.details)
+        })
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Safari has native HLS
-        video.src = src
+        // Safari has native HLS — use the proxy for CORS consistency
+        video.src = proxySrc
         video.play().catch(() => {})
       }
     })

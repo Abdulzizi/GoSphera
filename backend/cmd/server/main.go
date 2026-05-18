@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -89,6 +90,10 @@ func main() {
 	r.Get("/api/ships", handleShips(maritimeCache))
 	r.Get("/api/cameras", handleCameras(cameraCache))
 	r.Get("/api/camera-proxy/{id}", handleCameraProxy(cameraCache))
+	// HLS relay: proxies .m3u8 playlists + .ts segments through the backend,
+	// solving CORS for any HLS source regardless of its origin headers.
+	r.Get("/api/stream/{id}/playlist.m3u8", handleHLSPlaylist(cameraCache))
+	r.Get("/api/stream/{id}/seg", handleHLSSegment())
 	r.Post("/api/telemetry", handleTelemetryIngest(pipeline))
 	r.Get("/api/events", handleSSE(broker))
 
@@ -377,6 +382,123 @@ func handleCameraProxy(cache *camera.Cache) http.HandlerFunc {
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body) //nolint:errcheck
 	}
+}
+
+// ── HLS Relay Proxy ───────────────────────────────────────────────────────────
+//
+// handleHLSPlaylist fetches the camera's StreamURL (.m3u8) and rewrites every
+// URI line so it points back through /api/stream/{id}/seg?u=<encoded-url>.
+// This makes ANY HLS stream browser-playable regardless of CORS policy.
+//
+// The rewrite handles both:
+//   - Master playlists  (list of variant-quality sub-playlists)
+//   - Media playlists   (list of .ts segments)
+//
+// It resolves relative URLs against the playlist's own URL before rewriting.
+
+var hlsProxyClient = &http.Client{Timeout: 15 * time.Second}
+
+func handleHLSPlaylist(cache *camera.Cache) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		cam := cache.FindByID(id)
+		if cam == nil || cam.StreamURL == "" {
+			http.Error(w, "camera not found or no stream URL", http.StatusNotFound)
+			return
+		}
+		rewriteM3U8(w, r, id, cam.StreamURL)
+	}
+}
+
+// handleHLSSegment proxies any resource (sub-playlist or .ts segment) whose
+// absolute URL is passed in the ?u= query parameter.
+// Sub-playlists (.m3u8) are rewritten recursively; .ts segments are streamed as-is.
+func handleHLSSegment() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		rawURL := r.URL.Query().Get("u")
+		if rawURL == "" {
+			http.Error(w, "missing ?u= parameter", http.StatusBadRequest)
+			return
+		}
+		targetURL, err := url.QueryUnescape(rawURL)
+		if err != nil {
+			http.Error(w, "invalid URL encoding", http.StatusBadRequest)
+			return
+		}
+		// Sub-playlists (.m3u8) must be rewritten too so their segments are proxied
+		if strings.Contains(strings.ToLower(targetURL), ".m3u8") {
+			rewriteM3U8(w, r, id, targetURL)
+			return
+		}
+		// Raw media segment (.ts, .aac, etc.) — stream through
+		resp, err := hlsProxyClient.Get(targetURL)
+		if err != nil {
+			http.Error(w, "upstream segment error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "video/mp2t"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Cache-Control", "public, max-age=10")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		io.Copy(w, resp.Body) //nolint:errcheck
+	}
+}
+
+// rewriteM3U8 fetches an .m3u8 playlist from srcURL, rewrites all URI lines
+// so they go through /api/stream/{cameraID}/seg?u=<encoded-absolute-url>,
+// and writes the modified playlist to w.
+func rewriteM3U8(w http.ResponseWriter, _ *http.Request, cameraID, srcURL string) {
+	resp, err := hlsProxyClient.Get(srcURL)
+	if err != nil {
+		http.Error(w, "upstream playlist error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "playlist read error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Determine base URL for resolving relative references
+	base, _ := url.Parse(srcURL)
+
+	lines := strings.Split(string(body), "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Blank lines and comment/tag lines are passed through unchanged
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			out = append(out, line)
+			continue
+		}
+		// URI line — resolve and rewrite through the segment proxy
+		abs := hlsResolve(base, trimmed)
+		out = append(out, fmt.Sprintf("/api/stream/%s/seg?u=%s", cameraID, url.QueryEscape(abs)))
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	fmt.Fprint(w, strings.Join(out, "\n"))
+}
+
+// hlsResolve turns a possibly-relative HLS URI into an absolute URL.
+func hlsResolve(base *url.URL, ref string) string {
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+		return ref
+	}
+	refURL, err := url.Parse(ref)
+	if err != nil {
+		return ref
+	}
+	return base.ResolveReference(refURL).String()
 }
 
 // helpers
