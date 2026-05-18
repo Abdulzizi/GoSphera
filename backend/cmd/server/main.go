@@ -180,10 +180,23 @@ func handleSpatialQuery(client *spatial.Client) http.HandlerFunc {
 	}
 }
 
-// handleSituational handles GET /api/situational
+// handleSituational handles GET /api/situational?limit=N (default 500, max 5000)
 func handleSituational(cache *aggregator.Cache) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, cache.GetAll())
+	return func(w http.ResponseWriter, r *http.Request) {
+		records := cache.GetAll()
+		limit := 500
+		if s := r.URL.Query().Get("limit"); s != "" {
+			if n, err := strconv.Atoi(s); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		if limit > 5000 {
+			limit = 5000
+		}
+		if limit < len(records) {
+			records = records[:limit]
+		}
+		writeJSON(w, http.StatusOK, records)
 	}
 }
 
@@ -229,9 +242,7 @@ func parseBBox(parts []string) (spatial.BoundingBox, error) {
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func jsonError(w http.ResponseWriter, msg string, status int) {
