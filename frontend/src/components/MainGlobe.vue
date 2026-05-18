@@ -11,6 +11,26 @@
       <span v-if="!data && !isLoading" class="hint">Select tags &amp; bbox, then click Query</span>
       <span v-else-if="data" class="info">{{ featureCount }} features loaded</span>
     </div>
+
+    <!-- Camera fullscreen live feed modal -->
+    <Teleport to="body">
+      <div v-if="fullscreenCam" class="cam-fs-backdrop" @click.self="closeCamFs">
+        <div class="cam-fs-modal">
+          <div class="cam-fs-header">
+            <span>📷 <b>{{ fullscreenCam.name }}</b>
+              <span class="cam-fs-city">({{ fullscreenCam.city }})</span>
+            </span>
+            <div class="cam-fs-actions">
+              <span class="cam-fs-live">🔴 Live</span>
+              <button class="cam-fs-close" @click="closeCamFs">✕</button>
+            </div>
+          </div>
+          <img :src="fullscreenSrc" class="cam-fs-img" alt="Live camera feed"
+            @error="($event.target as HTMLImageElement).style.opacity = '0.2'">
+          <div class="cam-fs-footer">Auto-refreshes every 15 s · {{ fullscreenCam.city }}</div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -18,6 +38,8 @@
 import { ref, shallowRef, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import 'leaflet.markercluster'
+import 'leaflet.markercluster/dist/MarkerCluster.css'
 import type { FeatureCollection, FireRecord, AircraftState, ShipState, CameraInfo, BBox } from '../services/api'
 
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png'
@@ -47,22 +69,43 @@ const emit = defineEmits<{
 }>()
 
 // ── Refs ───────────────────────────────────────────────────────────────────────
-const mapEl       = ref<HTMLDivElement | null>(null)
-const mapInstance = shallowRef<L.Map | null>(null)
-const tileLayer   = shallowRef<L.TileLayer | null>(null)
-const geoLayer    = shallowRef<L.GeoJSON | null>(null)
-const fireLayer   = shallowRef<L.LayerGroup | null>(null)
-const cameraLayer = shallowRef<L.LayerGroup | null>(null)
-const currentZoom = ref(2)
+const mapEl         = ref<HTMLDivElement | null>(null)
+const mapInstance   = shallowRef<L.Map | null>(null)
+const tileLayer     = shallowRef<L.TileLayer | null>(null)
+const geoLayer      = shallowRef<L.GeoJSON | null>(null)
+const fireLayer     = shallowRef<L.LayerGroup | null>(null)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const shipCluster   = shallowRef<any>(null)   // L.MarkerClusterGroup
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const cameraCluster = shallowRef<any>(null)   // L.MarkerClusterGroup
+const currentZoom   = ref(2)
+const featureCount  = computed(() => props.data?.features.length ?? 0)
 
-const featureCount = computed(() => props.data?.features.length ?? 0)
+// ── Camera fullscreen overlay ─────────────────────────────────────────────────
+const fullscreenCam = ref<{ id: string; name: string; city: string; url: string } | null>(null)
+const fullscreenSrc = ref('')
+let fullscreenTimer: ReturnType<typeof setInterval> | null = null
 
-// ── Aircraft: DivIcon ✈ registry + RAF smooth interpolation ───────────────────
-// Shown only at zoom >= 4 (prevents 8k DOM nodes at global view)
+function openCamFs(cam: { id: string; name: string; city: string; url: string }) {
+  fullscreenCam.value = cam
+  fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
+  if (fullscreenTimer) clearInterval(fullscreenTimer)
+  fullscreenTimer = setInterval(() => {
+    fullscreenSrc.value = `${cam.url}?t=${Date.now()}`
+  }, 15_000)
+}
+
+function closeCamFs() {
+  fullscreenCam.value = null
+  fullscreenSrc.value = ''
+  if (fullscreenTimer) { clearInterval(fullscreenTimer); fullscreenTimer = null }
+}
+
+// ── Aircraft: DivIcon ✈ + RAF interpolation ───────────────────────────────────
 type AircraftEntry = {
-  marker:    L.Marker
-  fromLat:   number; fromLon:   number
-  toLat:     number; toLon:     number
+  marker: L.Marker
+  fromLat: number; fromLon: number
+  toLat:   number; toLon:   number
   startTime: number
 }
 const aircraftRegistry = new Map<string, AircraftEntry>()
@@ -71,74 +114,85 @@ const INTERP_MS = 14_000
 
 function makePlaneIcon(heading: number, onGround: boolean): L.DivIcon {
   const color  = onGround ? '#9ca3af' : '#60a5fa'
-  const shadow = onGround ? 'none'    : '0 0 5px rgba(96,165,250,0.7)'
+  const shadow = onGround ? 'none' : '0 0 5px rgba(96,165,250,0.7)'
   return L.divIcon({
     html: `<div style="transform:rotate(${heading}deg);color:${color};font-size:14px;line-height:1;text-shadow:${shadow};user-select:none;width:14px;height:14px;display:flex;align-items:center;justify-content:center">✈</div>`,
     className: '',
-    iconSize:    [14, 14],
-    iconAnchor:  [7, 7],
-    popupAnchor: [0, -10],
+    iconSize: [14, 14], iconAnchor: [7, 7], popupAnchor: [0, -10],
   })
 }
 
-function tickAircraft(now: number) {
-  for (const entry of aircraftRegistry.values()) {
-    const t = Math.min(1, (now - entry.startTime) / INTERP_MS)
-    const lat = entry.fromLat + (entry.toLat - entry.fromLat) * t
-    const lon = entry.fromLon + (entry.toLon - entry.fromLon) * t
-    entry.marker.setLatLng([lat, lon])
-  }
-  rafId = requestAnimationFrame(tickAircraft)
-}
-
-// ── Ships: canvas circleMarker registry + RAF ──────────────────────────────────
+// ── Ships: vessel-shaped DivIcon + markerClusterGroup + RAF ───────────────────
 type ShipEntry = {
-  marker:    L.CircleMarker
-  fromLat:   number; fromLon:   number
-  toLat:     number; toLon:     number
+  marker: L.Marker
+  fromLat: number; fromLon: number
+  toLat:   number; toLon:   number
   startTime: number
 }
 const shipRegistry = new Map<number, ShipEntry>()
+
+function makeShipIcon(heading: number): L.DivIcon {
+  // Boat silhouette: narrow bow pointing north, rotated by heading
+  const svg = `<svg viewBox="0 0 12 20" width="12" height="20" xmlns="http://www.w3.org/2000/svg">
+    <polygon points="6,0 12,20 6,14 0,20" fill="#10b981" stroke="#047857" stroke-width="0.8"/>
+  </svg>`
+  return L.divIcon({
+    html: `<div style="transform:rotate(${heading}deg);line-height:0;filter:drop-shadow(0 0 3px rgba(16,185,129,0.6))">${svg}</div>`,
+    className: '',
+    iconSize: [12, 20], iconAnchor: [6, 10], popupAnchor: [0, -10],
+  })
+}
+
+// ── Cluster count icons ────────────────────────────────────────────────────────
+function hexToRgb(hex: string): string {
+  return `${parseInt(hex.slice(1,3),16)},${parseInt(hex.slice(3,5),16)},${parseInt(hex.slice(5,7),16)}`
+}
+
+function makeCountCluster(count: number, hex: string): L.DivIcon {
+  const rgb = hexToRgb(hex)
+  return L.divIcon({
+    html: `<div style="background:rgba(${rgb},0.15);border:1.5px solid ${hex};border-radius:4px;padding:2px 8px;color:${hex};font-size:11px;font-weight:700;font-family:ui-monospace,monospace;white-space:nowrap;box-shadow:0 0 8px rgba(${rgb},0.35)">[${count}]</div>`,
+    className: '',
+    iconSize: L.point(52, 22, true),
+    iconAnchor: [26, 11],
+  })
+}
+
+// ── Combined RAF tick: aircraft + ships ───────────────────────────────────────
+function tickMovers(now: number) {
+  for (const e of aircraftRegistry.values()) {
+    const t = Math.min(1, (now - e.startTime) / INTERP_MS)
+    e.marker.setLatLng([e.fromLat + (e.toLat - e.fromLat) * t, e.fromLon + (e.toLon - e.fromLon) * t])
+  }
+  for (const e of shipRegistry.values()) {
+    const t = Math.min(1, (now - e.startTime) / INTERP_MS)
+    e.marker.setLatLng([e.fromLat + (e.toLat - e.fromLat) * t, e.fromLon + (e.toLon - e.fromLon) * t])
+  }
+  rafId = requestAnimationFrame(tickMovers)
+}
 
 // ── Tile definitions ───────────────────────────────────────────────────────────
 const tileDefs: Record<MapStyle, { url: string; options: L.TileLayerOptions }> = {
   dark: {
     url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    options: {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
-      subdomains: 'abcd', maxZoom: 19,
-    },
+    options: { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>', subdomains: 'abcd', maxZoom: 19 },
   },
   light: {
     url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-    options: {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
-      subdomains: 'abcd', maxZoom: 19,
-    },
+    options: { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>', subdomains: 'abcd', maxZoom: 19 },
   },
   satellite: {
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    options: {
-      attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics',
-      maxZoom: 18,
-    },
+    options: { attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics', maxZoom: 18 },
   },
 }
 
 // ── Formatters ─────────────────────────────────────────────────────────────────
-function fmtAlt(m: number): string {
-  return m ? `${Math.round(m).toLocaleString()} m (${Math.round(m * 3.28084).toLocaleString()} ft)` : 'n/a'
-}
-function fmtSpeed(ms: number): string {
-  return ms ? `${Math.round(ms)} m/s (${Math.round(ms * 1.944)} kts)` : 'n/a'
-}
-function fmtKnots(kts: number): string {
-  return kts ? `${kts.toFixed(1)} kts` : 'n/a'
-}
+function fmtAlt(m: number)   { return m ? `${Math.round(m).toLocaleString()} m (${Math.round(m*3.28084).toLocaleString()} ft)` : 'n/a' }
+function fmtSpeed(ms: number){ return ms ? `${Math.round(ms)} m/s (${Math.round(ms*1.944)} kts)` : 'n/a' }
+function fmtKnots(k: number) { return k ? `${k.toFixed(1)} kts` : 'n/a' }
 
 // ── Zoom-adaptive FIRMS downsampling ──────────────────────────────────────────
-// Grid-cell spatial hash: at low zoom, keep one representative point per cell.
-// cellDeg at z2 ≈ 3.2°, at z6 ≈ 0.2°, at z7+ full resolution.
 function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
   if (zoom >= 7) return records
   const cellDeg = Math.pow(2, 7 - zoom) * 0.05
@@ -151,22 +205,15 @@ function downsampleFire(records: FireRecord[], zoom: number): FireRecord[] {
 }
 
 function renderFireLayer() {
-  const map = mapInstance.value
-  if (!map) return
-  fireLayer.value?.remove()
-  fireLayer.value = null
+  const map = mapInstance.value; if (!map) return
+  fireLayer.value?.remove(); fireLayer.value = null
   if (!props.fireData?.length) return
-
   const sampled = downsampleFire(props.fireData, currentZoom.value)
   const group = L.layerGroup()
   for (const r of sampled) {
     L.circleMarker([r.latitude, r.longitude], {
       radius: 4, color: '#f97316', fillColor: '#f97316', fillOpacity: 0.7, weight: 0.5,
-    })
-      .bindPopup(
-        `<b>🔥 Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>` +
-        `Confidence: ${r.confidence}<br>Date: ${r.acq_date}`,
-      )
+    }).bindPopup(`<b>🔥 Fire</b><br>Brightness: ${r.brightness.toFixed(1)} K<br>Confidence: ${r.confidence}<br>Date: ${r.acq_date}`)
       .addTo(group)
   }
   if (props.showFire) group.addTo(map)
@@ -178,16 +225,14 @@ let moveDebounce: ReturnType<typeof setTimeout> | null = null
 
 function emitCurrentBounds(map: L.Map) {
   const b = map.getBounds()
-  const zoom = map.getZoom()
   emit('bbox-change', {
     minLat: b.getSouth(), minLon: b.getWest(),
     maxLat: b.getNorth(), maxLon: b.getEast(),
-    zoom,
+    zoom: map.getZoom(),
   })
 }
 
 // ── Aircraft zoom visibility ────────────────────────────────────────────────────
-// At zoom < 4 the entire globe is visible — hiding aircraft avoids 8k DOM nodes.
 function syncAircraftVisibility(map: L.Map) {
   const show = currentZoom.value >= 4 && props.showAircraft
   for (const { marker } of aircraftRegistry.values()) {
@@ -202,47 +247,67 @@ onMounted(async () => {
   if (!mapEl.value) return
 
   const map = L.map(mapEl.value, {
-    center: [20, 0],
-    zoom: 2,
-    minZoom: 2,
-    preferCanvas: true,
-    zoomControl: false,
-    maxBounds: [[-90, -Infinity], [90, Infinity]],
-    maxBoundsViscosity: 1.0,
+    center: [20, 0], zoom: 2, minZoom: 2,
+    preferCanvas: true, zoomControl: false,
+    maxBounds: [[-90, -Infinity], [90, Infinity]], maxBoundsViscosity: 1.0,
   })
-
   const def = tileDefs[props.mapStyle]
   tileLayer.value = L.tileLayer(def.url, def.options).addTo(map)
   L.control.zoom({ position: 'bottomright' }).addTo(map)
   map.invalidateSize(true)
   mapInstance.value = map
 
-  // Debounced bbox emit on pan
+  // Ship cluster group — teal [N] cluster icons
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sClu = (L as any).markerClusterGroup({
+    maxClusterRadius: 60,
+    disableClusteringAtZoom: 11,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: (cluster: { getChildCount(): number }) =>
+      makeCountCluster(cluster.getChildCount(), '#10b981'),
+  })
+  if (props.showShips) sClu.addTo(map)
+  shipCluster.value = sClu
+
+  // Camera cluster group — amber [N] cluster icons
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cClu = (L as any).markerClusterGroup({
+    maxClusterRadius: 60,
+    disableClusteringAtZoom: 13,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: (cluster: { getChildCount(): number }) =>
+      makeCountCluster(cluster.getChildCount(), '#f59e0b'),
+  })
+  if (props.showCameras) cClu.addTo(map)
+  cameraCluster.value = cClu
+
   map.on('moveend', () => {
     if (moveDebounce) clearTimeout(moveDebounce)
     moveDebounce = setTimeout(() => emitCurrentBounds(map), 400)
   })
 
-  // On zoom: update current zoom, re-downsample fire, sync aircraft visibility
   map.on('zoomend', () => {
     currentZoom.value = map.getZoom()
     renderFireLayer()
     syncAircraftVisibility(map)
   })
 
-  // Emit initial bounds after tiles settle
   setTimeout(() => emitCurrentBounds(map), 300)
-
-  rafId = requestAnimationFrame(tickAircraft)
+  rafId = requestAnimationFrame(tickMovers)
 })
 
 onUnmounted(() => {
   if (moveDebounce) clearTimeout(moveDebounce)
   if (rafId !== null) cancelAnimationFrame(rafId)
+  if (fullscreenTimer) clearInterval(fullscreenTimer)
   for (const { marker } of aircraftRegistry.values()) marker.remove()
   aircraftRegistry.clear()
   for (const { marker } of shipRegistry.values()) marker.remove()
   shipRegistry.clear()
+  shipCluster.value?.clearLayers()
+  cameraCluster.value?.clearLayers()
   mapInstance.value?.remove()
   mapInstance.value = null
 })
@@ -272,136 +337,145 @@ watch(() => props.data, (fc) => {
     },
   }).addTo(map)
   geoLayer.value = layer
-  try { map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] }) } catch {}
+  try { map.fitBounds(layer.getBounds(), { maxZoom: 14, padding: [20, 20] }) } catch { /* empty */ }
 })
 
-// ── FIRMS fire dots ────────────────────────────────────────────────────────────
+// ── FIRMS fire layer ───────────────────────────────────────────────────────────
 watch(() => props.fireData, () => renderFireLayer())
 
-// ── Aircraft: ✈ DivIcon registry, zoom-gated, RAF-interpolated ────────────────
+// ── Aircraft ──────────────────────────────────────────────────────────────────
 watch(() => props.aircraftData, (states) => {
   const map = mapInstance.value; if (!map) return
   const showNow = currentZoom.value >= 4 && props.showAircraft
-
   const seen = new Set<string>()
   for (const s of states) {
     seen.add(s.icao24)
-    const existing = aircraftRegistry.get(s.icao24)
-    if (existing) {
-      const cur = existing.marker.getLatLng()
-      existing.fromLat = cur.lat; existing.fromLon = cur.lng
-      existing.toLat   = s.lat;   existing.toLon   = s.lon
-      existing.startTime = performance.now()
-      existing.marker.setIcon(makePlaneIcon(s.heading, s.on_ground))
+    const ex = aircraftRegistry.get(s.icao24)
+    if (ex) {
+      const cur = ex.marker.getLatLng()
+      ex.fromLat = cur.lat; ex.fromLon = cur.lng
+      ex.toLat = s.lat; ex.toLon = s.lon
+      ex.startTime = performance.now()
+      ex.marker.setIcon(makePlaneIcon(s.heading, s.on_ground))
     } else {
       const marker = L.marker([s.lat, s.lon], { icon: makePlaneIcon(s.heading, s.on_ground) })
-      const callsign = s.callsign || s.icao24
       marker.bindPopup(
         `<div style="font-size:12px;min-width:160px">
-          <b style="font-size:13px">${callsign}</b><br>
+          <b style="font-size:13px">${s.callsign || s.icao24}</b><br>
           <span style="color:#888">${s.icao24} · ${s.country}</span>
           <hr style="margin:4px 0;border-color:#333">
           <b>Alt:</b> ${fmtAlt(s.altitude)}<br>
           <b>Speed:</b> ${fmtSpeed(s.velocity)}<br>
           <b>Heading:</b> ${Math.round(s.heading)}°<br>
           <b>Status:</b> ${s.on_ground ? '🟡 On ground' : '🔵 Airborne'}
-        </div>`,
-        { maxWidth: 220 },
-      )
+        </div>`, { maxWidth: 220 })
       if (showNow) marker.addTo(map)
-      aircraftRegistry.set(s.icao24, {
-        marker, fromLat: s.lat, fromLon: s.lon,
-        toLat: s.lat, toLon: s.lon, startTime: performance.now(),
-      })
+      aircraftRegistry.set(s.icao24, { marker, fromLat: s.lat, fromLon: s.lon, toLat: s.lat, toLon: s.lon, startTime: performance.now() })
     }
   }
-  // Remove aircraft no longer in feed
-  for (const [id, entry] of aircraftRegistry) {
-    if (!seen.has(id)) { entry.marker.remove(); aircraftRegistry.delete(id) }
+  for (const [id, e] of aircraftRegistry) {
+    if (!seen.has(id)) { e.marker.remove(); aircraftRegistry.delete(id) }
   }
 })
 
-// ── Ships: canvas circleMarker registry ────────────────────────────────────────
+// ── Ships ─────────────────────────────────────────────────────────────────────
 watch(() => props.shipData, (states) => {
-  const map = mapInstance.value; if (!map) return
-
+  const cluster = shipCluster.value; if (!cluster) return
   const seen = new Set<number>()
   for (const s of states) {
     seen.add(s.mmsi)
-    const existing = shipRegistry.get(s.mmsi)
-    if (existing) {
-      const cur = existing.marker.getLatLng()
-      existing.fromLat = cur.lat; existing.fromLon = cur.lng
-      existing.toLat   = s.lat;   existing.toLon   = s.lon
-      existing.startTime = performance.now()
+    const ex = shipRegistry.get(s.mmsi)
+    if (ex) {
+      const cur = ex.marker.getLatLng()
+      ex.fromLat = cur.lat; ex.fromLon = cur.lng
+      ex.toLat = s.lat; ex.toLon = s.lon
+      ex.startTime = performance.now()
+      ex.marker.setIcon(makeShipIcon(s.heading))
     } else {
-      const marker = L.circleMarker([s.lat, s.lon], {
-        radius: 5, color: '#10b981', fillColor: '#10b981', fillOpacity: 0.85, weight: 1,
-      })
-      const name = s.name || String(s.mmsi)
+      const marker = L.marker([s.lat, s.lon], { icon: makeShipIcon(s.heading) })
       marker.bindPopup(
         `<div style="font-size:12px;min-width:160px">
-          <b style="font-size:13px">🚢 ${name}</b><br>
+          <b style="font-size:13px">🚢 ${s.name || s.mmsi}</b><br>
           <span style="color:#888">MMSI: ${s.mmsi}</span>
           <hr style="margin:4px 0;border-color:#333">
           <b>Speed:</b> ${fmtKnots(s.speed)}<br>
           <b>Heading:</b> ${Math.round(s.heading)}°
-        </div>`,
-        { maxWidth: 200 },
-      )
-      if (props.showShips) marker.addTo(map)
-      shipRegistry.set(s.mmsi, {
-        marker, fromLat: s.lat, fromLon: s.lon,
-        toLat: s.lat, toLon: s.lon, startTime: performance.now(),
-      })
+        </div>`, { maxWidth: 200 })
+      cluster.addLayer(marker)
+      shipRegistry.set(s.mmsi, { marker, fromLat: s.lat, fromLon: s.lon, toLat: s.lat, toLon: s.lon, startTime: performance.now() })
     }
   }
-  for (const [id, entry] of shipRegistry) {
-    if (!seen.has(id)) { entry.marker.remove(); shipRegistry.delete(id) }
+  for (const [id, e] of shipRegistry) {
+    if (!seen.has(id)) { cluster.removeLayer(e.marker); shipRegistry.delete(id) }
   }
 })
 
-// ── CCTV cameras ───────────────────────────────────────────────────────────────
+// ── Cameras ───────────────────────────────────────────────────────────────────
 watch(() => props.cameraData, (cameras) => {
-  const map = mapInstance.value; if (!map) return
-  cameraLayer.value?.remove(); cameraLayer.value = null
-  if (!cameras?.length) return
-  const group = L.layerGroup()
+  const cluster = cameraCluster.value; if (!cluster) return
+  cluster.clearLayers()
+
   for (const c of cameras) {
-    L.circleMarker([c.lat, c.lon], {
-      radius: 6, color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 0.9, weight: 1.5,
+    const dotIcon = L.divIcon({
+      html: `<div style="width:10px;height:10px;border-radius:50%;background:#f59e0b;border:1.5px solid #d97706;box-shadow:0 0 6px rgba(245,158,11,0.7)"></div>`,
+      className: '', iconSize: [10, 10], iconAnchor: [5, 5], popupAnchor: [0, -8],
     })
-      .bindPopup(
-        `<div style="font-size:12px">
-          <b>📷 ${c.name}</b> <span style="color:#888">(${c.city})</span><br>
-          <img src="${c.snapshot_url}" style="width:280px;max-height:200px;object-fit:cover;border-radius:4px;margin-top:6px;display:block" loading="lazy" onerror="this.style.display='none'">
-        </div>`,
-        { maxWidth: 300 },
-      )
-      .addTo(group)
+    const marker = L.marker([c.lat, c.lon], { icon: dotIcon })
+    let refreshTimer: ReturnType<typeof setInterval> | null = null
+
+    marker.bindPopup(
+      `<div style="font-size:12px;min-width:220px">
+        <b>📷 ${c.name}</b> <span style="color:#888">(${c.city})</span>
+        <div style="margin-top:6px;position:relative;background:#050809;border-radius:4px;overflow:hidden;min-height:80px">
+          <img id="cam-prev-${c.id}"
+            src="${c.snapshot_url}?t=${Date.now()}"
+            style="width:100%;max-height:160px;object-fit:cover;display:block"
+            loading="lazy"
+            onerror="this.style.opacity='0.15'">
+        </div>
+        <button id="cam-fs-btn-${c.id}"
+          style="margin-top:6px;width:100%;padding:5px 0;background:#0d1e30;border:1px solid #1a4a6a;border-radius:4px;color:#60a5fa;cursor:pointer;font-size:11px;transition:background 0.15s"
+          onmouseover="this.style.background='#142840'"
+          onmouseout="this.style.background='#0d1e30'">
+          ⛶ &nbsp;Full Screen · Live Feed
+        </button>
+      </div>`,
+      { maxWidth: 280 },
+    )
+
+    marker.on('popupopen', () => {
+      // Auto-refresh preview image every 15s
+      refreshTimer = setInterval(() => {
+        const img = document.getElementById(`cam-prev-${c.id}`) as HTMLImageElement | null
+        if (img) img.src = `${c.snapshot_url}?t=${Date.now()}`
+      }, 15_000)
+      // Bind fullscreen button after DOM settles
+      setTimeout(() => {
+        const btn = document.getElementById(`cam-fs-btn-${c.id}`)
+        if (btn) btn.onclick = () => openCamFs({ id: c.id, name: c.name, city: c.city, url: c.snapshot_url })
+      }, 60)
+    })
+
+    marker.on('popupclose', () => {
+      if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+    })
+
+    cluster.addLayer(marker)
   }
-  if (props.showCameras) group.addTo(map)
-  cameraLayer.value = group
 })
 
-// ── Layer visibility toggles ───────────────────────────────────────────────────
+// ── Layer visibility ───────────────────────────────────────────────────────────
 watch(() => props.showAircraft, () => {
-  const map = mapInstance.value; if (!map) return
-  syncAircraftVisibility(map)
+  const map = mapInstance.value; if (map) syncAircraftVisibility(map)
 })
-
 watch(() => props.showShips, (v) => {
-  const map = mapInstance.value; if (!map) return
-  for (const { marker } of shipRegistry.values()) {
-    v ? marker.addTo(map) : marker.remove()
-  }
+  const map = mapInstance.value; if (!map || !shipCluster.value) return
+  v ? shipCluster.value.addTo(map) : shipCluster.value.remove()
 })
-
 watch(() => props.showCameras, (v) => {
-  const map = mapInstance.value; if (!map || !cameraLayer.value) return
-  v ? cameraLayer.value.addTo(map) : cameraLayer.value.remove()
+  const map = mapInstance.value; if (!map || !cameraCluster.value) return
+  v ? cameraCluster.value.addTo(map) : cameraCluster.value.remove()
 })
-
 watch(() => props.showFire, (v) => {
   const map = mapInstance.value; if (!map || !fireLayer.value) return
   v ? fireLayer.value.addTo(map) : fireLayer.value.remove()
@@ -426,13 +500,16 @@ watch(() => props.showFire, (v) => {
 .style-satellite :deep(.leaflet-container) { background: #1a1a1a; }
 .style-light :deep(.leaflet-popup-content-wrapper) { background: #fff; color: #111; }
 
+/* Remove default markercluster styling — we use custom [N] icons */
+:deep(.leaflet-cluster-anim .leaflet-marker-icon),
+:deep(.leaflet-cluster-anim .leaflet-marker-shadow) { transition: transform 0.3s ease-out, opacity 0.3s ease-out; }
+
 .loading-overlay {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center; gap: 10px;
   background: rgba(13,17,23,0.6);
   z-index: 1001; pointer-events: none;
 }
-
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner {
   width: 22px; height: 22px;
@@ -449,4 +526,66 @@ watch(() => props.showFire, (v) => {
 }
 .hint { color: #5a6a7a; font-size: 0.82rem; }
 .info { color: #3a8fd4; font-size: 0.82rem; font-weight: 600; }
+
+/* ── Camera fullscreen modal ─────────────────────────────────────────────── */
+.cam-fs-backdrop {
+  position: fixed; inset: 0; z-index: 10000;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex; align-items: center; justify-content: center;
+  backdrop-filter: blur(6px);
+}
+
+.cam-fs-modal {
+  background: #0d1117;
+  border: 1px solid #2a3a4a;
+  border-radius: 10px;
+  overflow: hidden;
+  max-width: min(92vw, 960px);
+  max-height: 90vh;
+  min-width: 360px;
+  display: flex; flex-direction: column;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.8);
+}
+
+.cam-fs-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 16px;
+  background: #080d13;
+  border-bottom: 1px solid #1e2a35;
+  font-size: 0.9rem; color: #c0d8e8;
+  flex-shrink: 0;
+}
+.cam-fs-city { color: #4a6a7a; margin-left: 4px; }
+
+.cam-fs-actions { display: flex; align-items: center; gap: 12px; }
+
+@keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.4 } }
+.cam-fs-live {
+  font-size: 0.75rem; color: #ef4444;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.cam-fs-close {
+  background: none; border: none;
+  color: #5a6a7a; font-size: 1rem; cursor: pointer;
+  padding: 2px 7px; border-radius: 4px;
+  transition: color 0.12s, background 0.12s;
+}
+.cam-fs-close:hover { color: #e0eaf4; background: #1a2535; }
+
+.cam-fs-img {
+  width: 100%;
+  max-height: calc(90vh - 100px);
+  object-fit: contain;
+  background: #050809;
+  flex: 1;
+}
+
+.cam-fs-footer {
+  padding: 8px 16px;
+  font-size: 0.72rem; color: #2a4a5a;
+  text-align: center;
+  border-top: 1px solid #1e2a35;
+  flex-shrink: 0;
+}
 </style>
